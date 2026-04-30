@@ -20,6 +20,10 @@ const modules = [
   { number: 12, title: "Integration", slug: "12-integration" },
 ]
 
+const tutorials = [
+  { title: "Alpamayo VLA", slug: "alpamayo" },
+]
+
 export default function Sidebar() {
   const pathname = usePathname()
   const [open, setOpen] = useState(false)
@@ -88,6 +92,40 @@ export default function Sidebar() {
                 )
               })}
             </ul>
+
+            <div className="mt-6 pt-6 border-t border-zinc-200 dark:border-zinc-800">
+              <p className="px-3 mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+                Tutorials
+              </p>
+              <ul className="space-y-1">
+                {tutorials.map((tut) => {
+                  const href = `/tutorials/${tut.slug}`
+                  const active = pathname === href || pathname.startsWith(href + "/")
+                  return (
+                    <li key={tut.slug}>
+                      <Link
+                        href={href}
+                        onClick={() => setOpen(false)}
+                        className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
+                          active
+                            ? "bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 font-medium"
+                            : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-900 hover:text-zinc-900 dark:hover:text-zinc-200"
+                        }`}
+                      >
+                        <span className={`shrink-0 w-7 h-7 flex items-center justify-center rounded text-xs font-bold ${
+                          active
+                            ? "bg-purple-100 dark:bg-purple-800 text-purple-700 dark:text-purple-200"
+                            : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400"
+                        }`}>
+                          T
+                        </span>
+                        <span>{tut.title}</span>
+                      </Link>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
           </nav>
         </div>
       </aside>

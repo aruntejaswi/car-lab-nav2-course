@@ -92,6 +92,37 @@ export default function Home() {
         </div>
       </section>
 
+      {/* Tutorials */}
+      <section className="max-w-5xl mx-auto px-6 py-12 border-t border-zinc-200 dark:border-zinc-800">
+        <h2 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100 mb-2">Tutorials</h2>
+        <p className="text-zinc-600 dark:text-zinc-400 mb-6 max-w-2xl">
+          Deep dives into advanced topics and experimental integrations with the school bus robot.
+        </p>
+        <a
+          href="/tutorials/alpamayo"
+          className="group block rounded-xl border border-zinc-200 dark:border-zinc-800 p-6 hover:border-purple-300 dark:hover:border-purple-700 hover:shadow-sm transition-all max-w-xl"
+        >
+          <div className="flex items-start gap-4">
+            <span className="shrink-0 w-10 h-10 flex items-center justify-center rounded-lg bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 font-bold text-sm">
+              T
+            </span>
+            <div>
+              <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 group-hover:text-purple-700 dark:group-hover:text-purple-300 transition-colors">
+                Running NVIDIA Alpamayo on a Ground Robot
+              </h3>
+              <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400 leading-6">
+                Domain transfer of a 10B Vision-Language-Action model from autonomous driving to a slow ground robot with a single camera.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <span className="rounded-full bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 px-2.5 py-0.5 text-xs font-medium">VLA</span>
+                <span className="rounded-full bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 px-2.5 py-0.5 text-xs font-medium">NVIDIA</span>
+                <span className="rounded-full bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 px-2.5 py-0.5 text-xs font-medium">Domain Transfer</span>
+              </div>
+            </div>
+          </div>
+        </a>
+      </section>
+
       {/* Footer */}
       <footer className="border-t border-border mt-12">
         <div className="max-w-5xl mx-auto px-6 py-8 text-sm text-zinc-500 dark:text-zinc-500">

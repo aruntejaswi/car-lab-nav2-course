@@ -1,0 +1,314 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# Running NVIDIA Alpamayo on a Ground Robot
+
+A hands-on look at what happens when you take a 10-billion-parameter autonomous driving model
+and point it at a slow indoor robot with a single camera.
+
+---
+
+## What is Alpamayo?
+
+**Alpamayo 1.5** is a Vision-Language-Action (VLA) model released by NVIDIA in late 2025. It was trained on
+large-scale autonomous driving data and is designed to predict future vehicle trajectories from camera images.
+
+The model takes two inputs:
+- **Camera frames** — 4 synchronized views (front, left, right, rear) at 10 Hz, with 0.4 seconds of history (4 frames per camera)
+- **Ego-motion history** — 1.6 seconds of the vehicle's own position and velocity
+
+And produces two outputs:
+- **A predicted trajectory** — 64 waypoints spanning 6.4 seconds into the future, in the vehicle's reference frame
+- **Chain-of-causation text** — a natural-language explanation of the model's reasoning (e.g., *"Nudge to the left to clear the construction equipment blocking the right side of our lane"*)
+
+<Callout type="why">
+Alpamayo is built on NVIDIA's **Cosmos-Reason2-8B** vision-language backbone — an 8B-parameter
+multimodal LLM that processes images and text together. The trajectory prediction head is trained
+on top of this frozen backbone, making Alpamayo a true VLA: it *sees*, *reasons*, and *acts*.
+</Callout>
+
+### Architecture at a glance
+
+```
+Camera frames (4 views × 4 timesteps)
+        ↓
+  Cosmos-Reason2-8B (frozen VLM backbone)
+        ↓
+  Vision-language features
+        ↓                    ↓
+  Trajectory head        Language head
+        ↓                    ↓
+  64 waypoints (x,y,z)  Chain-of-causation text
+  over 6.4 seconds       (driving rationale)
+```
+
+The model totals roughly 10 billion parameters and requires **24 GB of GPU VRAM** at minimum
+(bfloat16 precision). This means it cannot run on most consumer GPUs — we used a cloud
+RTX A5000 for inference.
+
+<Callout type="warning">
+Alpamayo requires access to **two** gated HuggingFace repositories: the
+[Alpamayo 1.5 model](https://huggingface.co/nvidia/Alpamayo-1.5-10B) itself and the
+[Cosmos-Reason2-8B](https://huggingface.co/nvidia/Cosmos-Reason2-8B) backbone. You must
+request and be granted access to both before you can download the weights.
+</Callout>
+
+---
+
+## Why try it on a ground robot?
+
+Alpamayo was trained exclusively on autonomous driving data — highway and urban scenes captured
+from cars moving at 15–70 mph with four cameras. Our school bus robot is about as far from that
+domain as you can get:
+
+| Dimension | Alpamayo training data | Our robot |
+|---|---|---|
+| **Speed** | 15–70 mph (7–31 m/s) | 0.3–1.8 m/s (walking pace) |
+| **Cameras** | 4 synchronized views | 1 front camera |
+| **Environment** | Roads, highways | Indoor hallways, outdoor sidewalks |
+| **Vehicle** | Passenger cars | 4-wheeled ground robot |
+
+This extreme domain gap makes the robot a useful testbed for understanding *what transfers* in a
+VLA model and *what doesn't*. If the model can still predict reasonable trajectories on a
+slow indoor robot, it tells us something about the generality of large-scale vision-language pretraining.
+
+---
+
+## The inference pipeline
+
+Running Alpamayo on robot data involves extracting synchronized samples from ROS2 bag files,
+shipping them to a cloud GPU, and running the model's forward pass.
+
+### Step 1: Record a rosbag
+
+Drive the robot (via RC joystick) while recording camera and odometry data:
+
+<CommandBlock command="ros2 bag record /routecam/image_raw /odometry/local -o robot_bag" description="Record camera + odometry to a rosbag" />
+
+### Step 2: Extract samples
+
+Each "sample" bundles 4 camera frames (0.4s of history) and 1.6s of ego-motion into a single
+file. A custom extractor script reads the rosbag and produces `.pkl` files:
+
+```python
+# For each candidate t0 timestamp:
+# 1. Find 4 camera frames at t0, t0-0.1s, t0-0.2s, t0-0.3s
+# 2. Extract ego-motion history from t0-1.6s to t0
+# 3. Extract ground-truth future trajectory from t0 to t0+6.4s
+# 4. Save as a pickle dict (numpy arrays, no torch dependency)
+```
+
+The extractor runs on any machine with ROS2 — no GPU needed.
+
+### Step 3: Run inference on cloud GPU
+
+Upload samples to a cloud instance with an A5000/A6000/A100 GPU (24+ GB VRAM), then run:
+
+```python
+# Load model (~30s one-time cost)
+model = AlpamayoModel.from_pretrained("nvidia/Alpamayo-1.5-10B")
+
+# For each sample:
+# 1. Load .pkl, convert numpy arrays to torch tensors
+# 2. Format camera frames into model's expected message structure
+# 3. Apply chat template (tokenize visual + motion inputs)
+# 4. Forward pass: model.sample_trajectories_from_data_with_vlm_rollout()
+# 5. Extract predicted waypoints (1×64×3) and chain-of-causation text
+```
+
+Each sample takes about **30 seconds** of inference time on an RTX A5000.
+
+### Step 4: Evaluate and visualize
+
+Compare predicted trajectories against ground truth using **minADE** (minimum Average
+Displacement Error) — the mean Euclidean distance between predicted and actual waypoints.
+
+<Callout type="why">
+**minADE** is the standard metric for trajectory prediction. Lower is better. NVIDIA's
+reference baseline on automotive data achieves **0.38 m** — meaning the model's predicted
+path deviates from reality by less than 40 cm on average over 6.4 seconds.
+</Callout>
+
+---
+
+## Results
+
+We ran Alpamayo through three progressively challenging scenarios to understand how the
+model handles domain transfer.
+
+### Automotive baseline (reference)
+
+First, we reproduced NVIDIA's reference result on their own automotive data to establish
+a baseline: **minADE = 0.38 m**.
+
+<div className="my-6 -mx-6 lg:-mx-20">
+<img src="/images/alpamayo/m0_hello_world.png" alt="Alpamayo automotive baseline — 4 camera views, BEV trajectory, and error curve showing 0.38m minADE" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full" />
+<div className="mt-2 text-sm text-zinc-500 dark:text-zinc-400 text-center px-6">
+Automotive reference clip. Top: 4 camera views. Middle-left: bird's-eye trajectory (green = ground truth, red = predicted).
+Middle-right: lateral nudge over time. Bottom: per-waypoint error peaking at 2.19 m at 5.3 seconds.
+</div>
+</div>
+
+The model correctly identifies construction equipment and reasons about lane positioning.
+The chain-of-causation reads: *"Nudge to the left to clear the construction equipment
+blocking the right side of our lane."*
+
+### Indoor robot — single camera (minADE: 1.87 m)
+
+Next, we ran 4 samples captured from the robot driving through indoor hallways at walking pace,
+using a single front-facing camera.
+
+<div className="my-6 -mx-6 lg:-mx-20">
+<img src="/images/alpamayo/m1_summary.png" alt="Indoor robot results — 4 samples with mean minADE 1.87m" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full" />
+<div className="mt-2 text-sm text-zinc-500 dark:text-zinc-400 text-center px-6">
+Indoor results. Top: robot camera frames for each sample. Middle: per-sample minADE (orange bars) vs.
+automotive baseline (dashed line) and BEV trajectories. Bottom-left: per-waypoint error curves
+diverging rapidly. Bottom-right: chain-of-causation text showing automotive hallucinations.
+</div>
+</div>
+
+The error is roughly 5x worse than the automotive baseline. More interesting is the
+**chain-of-causation text** — the model hallucinates automotive concepts:
+
+- *"Yield to the pedestrian since they are already using our path ahead"* (there was a person, but the model uses automotive road-user terminology)
+- *"Keep lane since the path ahead is clear"*
+- *"Adjust speed for the right curve since the lane bends right ahead"*
+
+The model is trying to interpret hallway walls as lane markings and doorways as intersections.
+It has never seen an indoor environment during training, so it maps everything onto the
+closest automotive concept it knows.
+
+### Outdoor street — single camera (minADE: 2.92 m)
+
+We then ran 21 samples from the robot driving along outdoor sidewalks and streets. Here
+the visual domain is much closer to the training data.
+
+<div className="my-6 -mx-6 lg:-mx-20">
+<img src="/images/alpamayo/m1b_outdoor_summary.png" alt="Outdoor robot results — 21 samples with mean minADE 2.92m" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full" />
+<div className="mt-2 text-sm text-zinc-500 dark:text-zinc-400 text-center px-6">
+Outdoor results. Top: per-sample minADE (orange bars) vs. automotive baseline (dashed line).
+Middle: camera frames and BEV trajectories for 6 representative samples. Bottom-left: per-waypoint error curves.
+Bottom-right: chain-of-causation text showing correct visual grounding outdoors.
+</div>
+</div>
+
+The outdoor chain-of-causation text is dramatically better — the model correctly identifies
+parked cars, road edges, and traffic patterns. The visual grounding clearly *transfers* to
+the outdoor domain. But the **trajectory scale** is still wrong: the model predicts
+car-speed distances for a robot moving at walking pace, resulting in 2.92 m mean minADE.
+
+<Callout type="why">
+This is the key finding: **visual understanding and action scale are decoupled** in VLA
+domain transfer. The model "sees" correctly outdoors but doesn't know how fast the robot
+moves. Indoors, both the visual domain and the action scale are wrong.
+</Callout>
+
+### Velocity calibration — the cheap fix (minADE: 1.20 m)
+
+Since the core problem is trajectory *scale* rather than trajectory *direction*, we applied
+a simple post-hoc fix: multiply all predicted waypoints by the ratio of actual robot speed
+to the speed the model assumed.
+
+<div className="my-6 -mx-6 lg:-mx-20">
+<img src="/images/alpamayo/m3_combined.png" alt="Velocity calibration results — 56% improvement from global rescaling" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full" />
+<div className="mt-2 text-sm text-zinc-500 dark:text-zinc-400 text-center px-6">
+Velocity calibration. (a) Calibration methods compared. (b) Error vs. prediction horizon — rescaling
+flattens the curve. (c) Speed ratio vs. error — outdoor samples (blue) cluster tightly; indoor (orange)
+show more variance.
+</div>
+</div>
+
+Results of the velocity calibration:
+
+| Method | Mean minADE | Improvement |
+|---|---|---|
+| Raw (no calibration) | 2.75 m | — |
+| Global rescaling | 1.20 m | 56% reduction |
+| Per-waypoint rescaling | 1.05 m | 62% reduction |
+| Direction oracle (ceiling) | 0.45 m | 84% reduction |
+
+<div className="my-6 -mx-6 lg:-mx-20">
+<img src="/images/alpamayo/m3_minade_bars.png" alt="Per-sample minADE comparison showing raw vs. calibrated performance" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full" />
+<div className="mt-2 text-sm text-zinc-500 dark:text-zinc-400 text-center px-6">
+Per-sample minADE sorted by raw error. Red = raw, blue = global rescaling, green = per-waypoint rescaling.
+The dashed line marks the M0 automotive baseline (0.38 m). After calibration, many outdoor samples
+approach baseline performance.
+</div>
+</div>
+
+The **direction oracle** — which gives each waypoint perfect magnitude but keeps the model's
+predicted direction — achieves 0.45 m, close to the automotive baseline. This confirms
+that the model's *directional* predictions transfer well; the remaining error is almost
+entirely in *how far* it thinks the robot will travel.
+
+<Callout type="see">
+After velocity calibration, many outdoor samples achieve minADE under 1.0 m — comparable to
+the automotive baseline. The samples that remain high-error tend to be ones where the model
+also got the direction wrong (turns, U-turns).
+</Callout>
+
+---
+
+## Key takeaways
+
+1. **Visual grounding transfers across domains.** Outdoors, Alpamayo correctly identifies roads,
+   vehicles, and obstacles even though it has never seen this robot or these specific streets.
+
+2. **Action scale does not transfer.** The model predicts car-speed trajectories for a
+   walking-speed robot. This is a systematic, correctable error.
+
+3. **A simple linear fix closes most of the gap.** Global velocity rescaling reduces error by
+   56% with zero retraining. This suggests that for many robotics applications, you might not
+   need to fine-tune the entire model — just calibrate the output scale.
+
+4. **Indoor environments break visual grounding.** Without familiar visual cues (lane markings,
+   road edges, other vehicles), the model hallucinates automotive concepts. Domain transfer
+   of the *vision* component requires visual similarity.
+
+5. **Chain-of-causation text is a diagnostic tool.** Reading the model's reasoning reveals
+   *what* it thinks it sees, which helps distinguish visual grounding failures from action
+   scale failures.
+
+---
+
+## Future directions
+
+Several natural extensions build on these findings:
+
+### Live ROS2 bridge
+Stream camera frames from the robot to a cloud GPU in real time and publish predicted
+trajectories back as a ROS2 topic. This would allow Alpamayo to serve as an advisory
+overlay in RViz — not controlling the robot, but showing where it *thinks* the robot
+should go, alongside Nav2's actual planned path.
+
+### Digital twin fine-tuning
+Import the school bus URDF into NVIDIA Isaac Sim to generate synthetic training data at
+robot speeds. Fine-tuning just the trajectory prediction head (with the VLM backbone frozen)
+could teach the model the correct action scale without losing its visual grounding.
+The research question: does sim-generated fine-tuning outperform the simple velocity
+rescaling, and by how much?
+
+### Quantization for edge deployment
+At 24 GB VRAM, Alpamayo cannot run on the robot's onboard hardware. INT8 or INT4
+quantization could potentially bring it within range of a 12 GB laptop GPU, enabling
+on-robot inference without cloud connectivity.
+
+### Multi-camera integration
+The robot currently uses a single front camera, but Alpamayo was trained on four views.
+Adding side and rear cameras could improve trajectory prediction, especially for turns
+and reversing maneuvers where the front camera alone provides limited information.
+
+---
+
+## Resources
+
+- [Alpamayo 1.5 on GitHub](https://github.com/NVlabs/alpamayo1.5) — model code and inference notebooks
+- [Alpamayo 1.5 on HuggingFace](https://huggingface.co/nvidia/Alpamayo-1.5-10B) — model weights (gated access)
+- [Cosmos-Reason2-8B](https://huggingface.co/nvidia/Cosmos-Reason2-8B) — the VLM backbone (also gated)
+- [PhysicalAI-Autonomous-Vehicles dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles) — NVIDIA's reference driving data
+
+---
+
+*This tutorial is part of the [CAR Lab](/) autonomous school bus project.
+The Alpamayo experiments were conducted as part of a graduate course on multi-modal deep learning.*
