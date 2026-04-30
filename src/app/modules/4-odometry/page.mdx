@@ -1,0 +1,328 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M4: Odometry — KISS-ICP LiDAR Odometry
+
+Estimating motion by matching consecutive 3D point clouds.
+
+---
+
+## Learning Objectives
+
+By the end of this module you will be able to:
+
+- Explain what odometry is and why a robot needs it
+- Describe how Iterative Closest Point (ICP) scan matching estimates motion
+- Read and interpret a ROS2 `nav_msgs/Odometry` message
+- Understand odometry drift and why it makes SLAM necessary
+
+**Prerequisites:** M1 (LiDAR) and M3 (TF). You should be comfortable with PointCloud2 messages, the Velodyne VLP-16, and the TF coordinate frame tree.
+
+---
+
+## What Is Odometry?
+
+Odometry answers one question: **how far have I moved from where I started?**
+
+Imagine walking across a dark room with your eyes closed. You can feel each step you take — the length and direction. If you started at the doorway and took three steps forward and one step right, you have a rough idea of where you are in the room. That internal sense of "I've moved this far in this direction" is odometry.
+
+Most wheeled robots measure odometry with **wheel encoders** — sensors that count how many times each wheel has rotated. Multiply rotations by wheel circumference and you get distance traveled. This school bus robot has no wheel encoders. None. The four motors spin, but nothing counts their rotations.
+
+Instead, this robot uses its LiDAR as its sole odometry source. The algorithm is called **KISS-ICP**, and it works by comparing consecutive 3D point clouds to figure out how the robot moved between them.
+
+<Callout type="why">
+  Without odometry, a robot has no sense of its own motion. It cannot follow a planned path, avoid obstacles it has already passed, or maintain a consistent map. Odometry is the foundation that every higher-level navigation system builds on — the EKF (M5), SLAM (M6), and Nav2's path following (M9) all consume odometry as input.
+</Callout>
+
+---
+
+## How ICP (Iterative Closest Point) Works
+
+The Velodyne LiDAR produces a 3D point cloud 10 times per second. Each cloud contains ~29,000 points representing the walls, floor, furniture, and obstacles around the robot. KISS-ICP compares consecutive clouds to compute how the robot moved.
+
+Here is the intuition:
+
+### Step 1: Capture two consecutive scans
+
+At time T, the LiDAR captures a point cloud — call it Cloud A. One tenth of a second later, at time T+1, it captures Cloud B. If the robot moved during that interval, Cloud B will be slightly shifted and rotated compared to Cloud A.
+
+### Step 2: Find the best alignment
+
+ICP asks: "What rotation and translation would I need to apply to Cloud B so that it lines up as closely as possible with Cloud A?" It does this iteratively:
+
+1. For each point in Cloud B, find the closest point in Cloud A
+2. Compute the rotation and translation that minimizes the total distance between all matched point pairs
+3. Apply that transform to Cloud B
+4. Repeat until the alignment stops improving (convergence)
+
+### Step 3: That alignment IS the robot's motion
+
+The rotation and translation that aligned the two clouds is exactly how much the robot moved between the two scans. If the best alignment required shifting Cloud B by 5 cm in the X direction and rotating it 2 degrees, then the robot moved 5 cm forward and turned 2 degrees.
+
+### Why "KISS"?
+
+KISS stands for "Keep It Simple, Stupid." It is a lightweight variant of ICP designed to be robust without complex tuning. Three design choices make it practical for real-time use on a Raspberry Pi:
+
+- **Voxel downsampling** reduces ~29,000 points to a manageable number by keeping only one point per 10 cm cube (voxel). Fewer points means faster matching.
+- **Adaptive threshold** automatically adjusts how far apart two points can be and still count as a "match." When the robot is moving fast, the threshold widens; when stationary, it tightens. This prevents false matches without manual tuning.
+- **Deskewing** corrects for the fact that the robot is moving during the 100 ms it takes for the LiDAR to complete one revolution. Without deskewing, a fast-moving robot would produce smeared point clouds where the back of the scan and the front of the scan don't agree on where walls are.
+
+<Callout type="see">
+  You can visualize this process in RViz2. Add a PointCloud2 display for <code>/kiss/local_map</code> — this shows the internal map that KISS-ICP builds by accumulating aligned scans. As the robot moves, you will see the map grow outward from the starting position.
+</Callout>
+
+---
+
+## Indoor Configuration
+
+KISS-ICP is configured through `kiss_icp_indoor.yaml`. Every parameter has a direct physical consequence. Here is the full configuration used on the school bus:
+
+```yaml
+kiss_icp_node:
+  ros__parameters:
+    data:
+      deskew: True
+      max_range: 10.0
+      min_range: 0.5
+    mapping:
+      voxel_size: 0.10
+      max_points_per_voxel: 20
+    adaptive_threshold:
+      initial_threshold: 0.3
+      min_motion_th: 0.02
+    registration:
+      max_num_iterations: 500
+      convergence_criterion: 0.0001
+      max_num_threads: 4
+```
+
+### Data parameters
+
+| Parameter | Value | Physical meaning |
+|-----------|-------|------------------|
+| `deskew` | `True` | Compensates for robot motion during the 100 ms scan revolution. Without this, point clouds from a moving robot are smeared — the first points in the scan were captured at a different robot position than the last points. |
+| `max_range` | `10.0` m | Ignore points beyond 10 meters. Indoor rooms are small, and distant points are noisy and unreliable. A wall 15 meters away through a doorway contributes more noise than information. |
+| `min_range` | `0.5` m | Ignore points within 0.5 meters. These are returns from the robot's own frame, cables, and mounting hardware. Including them would make ICP think the robot's own body is a stationary obstacle. |
+
+### Mapping parameters
+
+| Parameter | Value | Physical meaning |
+|-----------|-------|------------------|
+| `voxel_size` | `0.10` m | Downsample to one point per 10 cm cube. The raw cloud has ~29,000 points per scan — far too many for real-time ICP on a Raspberry Pi. Voxel downsampling keeps one representative point per 10 cm cube, reducing the count dramatically while preserving the shape of walls and obstacles. |
+| `max_points_per_voxel` | `20` | Keep at most 20 points in each voxel of the internal map. Prevents memory from growing unboundedly in areas the robot revisits frequently. |
+
+### Adaptive threshold parameters
+
+| Parameter | Value | Physical meaning |
+|-----------|-------|------------------|
+| `initial_threshold` | `0.3` m | Starting match tolerance: two points up to 30 cm apart can be considered a match. KISS-ICP adjusts this automatically based on observed motion. |
+| `min_motion_th` | `0.02` m | Minimum motion threshold: if the computed motion is less than 2 cm, KISS-ICP treats it as "the robot didn't move." This prevents tiny noise from accumulating into phantom drift when the robot is stationary. |
+
+### Registration parameters
+
+| Parameter | Value | Physical meaning |
+|-----------|-------|------------------|
+| `max_num_iterations` | `500` | Maximum number of ICP iterations per scan alignment. In practice, convergence happens in 10-50 iterations; 500 is a safety net for difficult environments (e.g., a long featureless hallway). |
+| `convergence_criterion` | `0.0001` | Stop iterating when the alignment improvement between iterations drops below 0.0001 meters (0.1 mm). At this point, further iterations produce no meaningful improvement. |
+| `max_num_threads` | `4` | Use all 4 cores of the Raspberry Pi for the nearest-neighbor search — the most computationally expensive part of ICP. |
+
+<Callout type="why">
+  The <code>voxel_size</code> parameter is the single most important tradeoff in ICP. A smaller voxel (e.g., 0.05 m) preserves more detail and can produce more accurate alignment, but takes longer to compute. A larger voxel (e.g., 0.20 m) is faster but loses fine detail — thin chair legs might disappear entirely. At 0.10 m, the school bus gets accurate enough alignment at a rate that keeps up with the LiDAR's 10 Hz output.
+</Callout>
+
+---
+
+## KISS-ICP Runtime Summary
+
+| Property | Value |
+|----------|-------|
+| Input topic | `/velodyne_points` (PointCloud2) |
+| Output topic | `/kiss/odometry` (nav_msgs/Odometry) |
+| Output rate | ~9.5 Hz (matches LiDAR input rate) |
+| TF published | `odom -> base_footprint` (disabled in bringup — see warning below) |
+| Frame convention | Position in `odom` frame, child is `base_footprint` |
+| Runs on | Laptop (launched by `bringup_launch.py`) |
+
+---
+
+## Hands-on: Reading Odometry Messages
+
+Let's look at what KISS-ICP actually publishes. Here is a real `nav_msgs/Odometry` message captured from the running robot while it was stationary:
+
+<CommandBlock command="ros2 topic echo /kiss/odometry --once" description="Print one odometry message from KISS-ICP" />
+
+<TerminalOutput title="Laptop — /kiss/odometry (robot stationary)">
+{`header:
+  stamp:
+    sec: 1777545710
+    nanosec: 255249920
+  frame_id: odom
+child_frame_id: base_footprint
+pose:
+  pose:
+    position:
+      x: -0.0007
+      y: 0.0006
+      z: 0.00003
+    orientation:
+      x: 0.000002
+      y: 0.000007
+      z: 0.00007
+      w: 1.0
+  covariance: [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, ...]
+twist:
+  twist:
+    linear:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+    angular:
+      x: 0.0
+      y: 0.0
+      z: 0.0`}
+</TerminalOutput>
+
+### Breaking this down
+
+**Header:**
+
+- `frame_id: odom` — the position is expressed relative to the `odom` frame. This is where the robot started. Every odometry reading is a displacement from the origin.
+- `child_frame_id: base_footprint` — the position describes where `base_footprint` (the robot) is located within the `odom` frame.
+
+**Pose — position:**
+
+- `x: -0.0007` (0.7 mm backward), `y: 0.0006` (0.6 mm left), `z: 0.00003` (0.03 mm up)
+- These are essentially zero. The robot has not moved. The sub-millimeter values are noise — ICP is matching near-identical consecutive scans and finding tiny phantom motions.
+
+**Pose — orientation:**
+
+- `x: 0.000002, y: 0.000007, z: 0.00007, w: 1.0` — a quaternion extremely close to identity (no rotation). The robot has not turned.
+
+**Pose — covariance:**
+
+- `[0.1, 0.0, ...]` — a 6x6 covariance matrix with 0.1 on the diagonal. This is a KISS-ICP default. It does **not** represent the actual uncertainty of this specific scan match — KISS-ICP publishes the same covariance regardless of scan quality. The EKF (M5) uses this value to weight KISS-ICP odometry against IMU data.
+
+**Twist:**
+
+- All zeros. The twist section represents instantaneous velocity. A stationary robot has zero velocity in all axes.
+
+<Callout type="see">
+  The <code>pose</code> section tells you WHERE the robot is (position and heading since startup). The <code>twist</code> section tells you HOW FAST the robot is moving right now. Nav2 uses both — pose for path tracking, twist for velocity control.
+</Callout>
+
+---
+
+## Odometry Drift
+
+Every ICP scan match contains a tiny error. Maybe the algorithm finds an alignment that is off by 0.5 mm. For a single scan, that error is negligible. But odometry works by chaining thousands of these estimates together: the robot's current position is the sum of every single scan-to-scan motion estimate since startup.
+
+Errors accumulate. After 100 scans, you might be off by 5 cm. After 1,000 scans, maybe 20 cm. After driving around a building for 10 minutes at 9.5 scans per second (5,700 scans), the accumulated error — called **drift** — can be significant.
+
+Here is what drift looks like in practice:
+
+1. The robot starts at position (0, 0)
+2. It drives a 10-meter loop around a room, returning to the exact physical starting point
+3. You echo `/kiss/odometry` — instead of (0, 0), it reads something like (0.3, -0.1)
+4. Odometry thinks the robot is 30 cm forward and 10 cm right of where it actually is
+
+The drift is worse in certain environments:
+
+- **Long featureless hallways** — the walls look the same everywhere, so ICP cannot distinguish between positions along the hall. Drift in the direction of travel accumulates rapidly.
+- **Repetitive environments** — rows of identical desks or shelves can cause ICP to match against the wrong copy, producing a sudden jump in estimated position.
+- **Fast rotation** — during turns, the deskewing correction has to work harder, and any residual error in deskewing becomes a rotation error that affects all subsequent position estimates.
+
+<Callout type="why">
+  Drift is not a bug — it is a fundamental property of all odometry systems. Wheel encoders drift too (wheel slip, uneven surfaces, tire wear). Visual odometry drifts (lighting changes, featureless walls). The solution is not to eliminate drift but to correct for it. That is exactly what SLAM does (M6) — it detects when the robot revisits a known location (loop closure) and applies a correction to snap the map back into alignment.
+</Callout>
+
+---
+
+## Known Issue: KISS-ICP TF Caching
+
+KISS-ICP needs to look up the transform from `3d_lidar_link` to `base_footprint` to convert LiDAR points into the robot's body frame. It does this TF lookup once at startup.
+
+The problem: **KISS-ICP caches TF lookup failures.** If `robot_state_publisher` has not started yet when KISS-ICP first tries to look up `3d_lidar_link`, the lookup fails with "frame does not exist." KISS-ICP caches this failure result and never retries.
+
+Even if you start `robot_state_publisher` a few seconds later and the `3d_lidar_link` frame becomes available, KISS-ICP continues using the cached failure. It will log errors like:
+
+<TerminalOutput title="KISS-ICP — cached TF failure">
+{`[kiss_icp_node] [WARN] Failed to find tf. Reason=Invalid frame ID "3d_lidar_link"
+  passed to canTransform argument source_frame - frame does not exist`}
+</TerminalOutput>
+
+**The fix is startup order.** Always start `robot_state_publisher` on the Pi before launching `bringup_launch.py` on the laptop. If you got the order wrong, kill `bringup_launch.py` and relaunch it — there is no way to clear the cached failure without restarting KISS-ICP.
+
+<Callout type="warning">
+  This is a real operational issue, not a theoretical one. The startup instructions in CLAUDE.md explicitly state: launch <code>robot_state_publisher</code> (step 3) before <code>bringup_launch.py</code> (step 4). If you skip step 3 or launch them simultaneously, KISS-ICP will silently fail to produce odometry, and everything downstream — EKF, SLAM, Nav2 — will fail with confusing "frame not found" errors that seem unrelated.
+</Callout>
+
+---
+
+## The odom->base_footprint TF
+
+KISS-ICP computes the `odom -> base_footprint` transform as part of its scan matching. By default, it publishes this transform to `/tf`. But on the school bus, this is disabled:
+
+```python
+# In bringup_launch.py
+publish_odom_tf: false
+```
+
+<Callout type="warning">
+  KISS-ICP does NOT publish the <code>odom -> base_footprint</code> TF on this robot. The EKF (M5) publishes it instead. The EKF fuses KISS-ICP odometry with IMU data to produce a smoother, more accurate transform. If both KISS-ICP and the EKF published this transform, TF2 would receive conflicting values and downstream nodes would see the robot flickering between two slightly different positions — breaking SLAM and Nav2.
+</Callout>
+
+The data flow is:
+
+```
+KISS-ICP  →  /kiss/odometry (topic)  →  EKF  →  odom→base_footprint (TF)
+                                         ↑
+                                    IMU data (M5)
+```
+
+KISS-ICP publishes its estimate as a topic message only. The EKF consumes that message, combines it with IMU data, and publishes the fused result as the authoritative TF transform.
+
+---
+
+## Try It
+
+### Level 1: Read One Odometry Message
+
+Echo a single odometry message from KISS-ICP. What are the x and y position values?
+
+<CommandBlock command="ros2 topic echo /kiss/odometry --once" description="Capture one odometry message" />
+
+Now push the robot forward slightly (10-20 cm) by hand and echo the topic again. The x value should increase. How closely does the change in x match the distance you pushed?
+
+<Callout type="see">
+  If the robot is stationary, x and y should be near zero (within a few millimeters of noise). After pushing the robot, x should increase by roughly the distance you pushed. If x shows 0.15 after a 15 cm push, KISS-ICP is tracking accurately.
+</Callout>
+
+### Level 2: Measure the Odometry Rate
+
+<CommandBlock command="ros2 topic hz /kiss/odometry" description="Measure KISS-ICP's output rate" />
+
+<TerminalOutput title="Laptop — topic hz">
+{`average rate: 9.544
+	min: 0.100s max: 0.110s std dev: 0.00280s window: 50`}
+</TerminalOutput>
+
+What determines this rate? It is not a configurable parameter — KISS-ICP produces one odometry estimate per incoming point cloud. The LiDAR spins at ~10 Hz, but processing takes a few milliseconds, so the output rate settles at ~9.5 Hz. If you see a significantly lower rate (e.g., 5 Hz), KISS-ICP is struggling to converge within the scan interval — usually a sign that the environment is too featureless or the Raspberry Pi is under CPU load.
+
+### Level 3: Observe Drift
+
+Drive the robot in a small loop (2-3 meters per side) and return it to exactly where it started. Echo the odometry before and after:
+
+<CommandBlock command="ros2 topic echo /kiss/odometry --once" description="Check odometry before the loop" />
+
+Drive the loop, then:
+
+<CommandBlock command="ros2 topic echo /kiss/odometry --once" description="Check odometry after returning to start" />
+
+<Callout type="see">
+  If odometry were perfect, x and y would return to zero. In practice, they will show some residual displacement — typically 10-30 cm after a small indoor loop. That residual is drift. The larger the loop and the more featureless the environment, the more drift you will observe. This is exactly the problem that SLAM (M6) exists to solve.
+</Callout>
+
+---
+
+**Next module:** [M5: Sensor Fusion](/modules/5-sensor-fusion) — Combining KISS-ICP odometry with IMU data using an Extended Kalman Filter.

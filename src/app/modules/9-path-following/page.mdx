@@ -1,0 +1,452 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M9: Path Following
+
+The planner found a path. Now the robot has to actually drive it.
+
+---
+
+## From Path to Motion
+
+In M8, the SmacPlannerHybrid produced a collision-free path from the robot's current position to the goal. That path is a sequence of poses — hundreds of (x, y, theta) waypoints laid out across the costmap. But a path is just a plan. The robot's wheels are not turning yet.
+
+The **controller** is the node that turns the plan into motion. Every control cycle (20 times per second on the school bus), it looks at the path, looks at where the robot is, and computes a velocity command — how fast to drive forward and how much to steer. This velocity command is published on `/cmd_vel` as a `geometry_msgs/Twist` message.
+
+The controller does not care how the path was planned. It receives a sequence of poses and follows them. If you swapped the planner from SmacPlannerHybrid to NavFn, the controller would work the same way. This separation — planner decides *where* to go, controller decides *how* to get there — is a core Nav2 design principle.
+
+<Callout type="why">
+The controller runs at a much higher frequency than the planner. The planner fires once per goal (or when replanning is triggered). The controller runs 20 times per second, continuously adjusting steering and speed. This is the node that keeps the robot on the path, reacts to small deviations, and ultimately determines how smoothly the robot drives.
+</Callout>
+
+---
+
+## Pure Pursuit: The Intuition
+
+Before looking at the school bus configuration, it helps to understand the algorithm behind it. The school bus uses **Regulated Pure Pursuit** (RPP), which is an enhanced version of the classic **Pure Pursuit** controller. Start with the classic version.
+
+### The carrot on a stick
+
+Imagine a circle drawn around the robot with a fixed radius — say, 1.2 meters. This is the **lookahead distance**. Now find the point where this circle intersects the path ahead of the robot. That point is the **lookahead point**, sometimes called the carrot.
+
+The robot steers toward the carrot. That is the entire algorithm.
+
+As the robot moves forward, the circle moves with it, and the carrot advances along the path. The robot is always chasing a point that stays just ahead of it — like a donkey following a carrot on a stick. The result is a smooth arc toward the path.
+
+### Why it works
+
+Pure Pursuit naturally produces smooth, arc-like trajectories. The robot never tries to make a sharp turn to get back on the path. Instead, it curves gently toward the lookahead point, which is always on the path. The further ahead the carrot is, the gentler the curve. The closer the carrot is, the tighter the turn.
+
+### The lookahead tradeoff
+
+The lookahead distance is the single most important parameter:
+
+- **Too short** (0.3 m): The robot reacts to every small deviation. It oscillates back and forth across the path like a drunk driver, overcorrecting constantly.
+- **Too long** (3.0 m): The robot cuts corners. On a tight turn, the carrot is past the corner, so the robot drives straight toward it instead of following the curve.
+- **Just right** (0.6-2.0 m for the school bus): Smooth tracking with acceptable corner-cutting.
+
+---
+
+## Regulated Pure Pursuit: The Smart Version
+
+Classic Pure Pursuit drives at constant speed. It does not slow down for curves, obstacles, or the goal. The robot rounds a tight corner at full speed. It plows toward a wall at full speed. It blasts past the goal at full speed.
+
+**Regulated Pure Pursuit** (RPP) fixes all three problems. It adds three velocity regulation behaviors on top of the basic carrot-chasing:
+
+### 1. Curvature regulation
+
+When the path curves sharply, the controller reduces speed. The tighter the curve, the slower the robot drives. This is controlled by:
+
+```yaml
+use_regulated_linear_velocity_scaling: true
+regulated_linear_scaling_min_radius: 0.9   # curves tighter than 0.9m radius trigger slowdown
+regulated_linear_scaling_min_speed: 0.25   # never slow below 0.25 m/s for curvature
+```
+
+If the current path curvature has a radius smaller than 0.9 meters, the robot slows down proportionally. But it never drops below 0.25 m/s — crawling to a halt on curves would make navigation painfully slow.
+
+### 2. Obstacle proximity regulation
+
+When obstacles are nearby (detected through the costmap), the controller can further reduce speed. On the school bus, this is currently **disabled**:
+
+```yaml
+use_cost_regulated_linear_velocity_scaling: false
+```
+
+This was a deliberate choice. The school bus operates indoors where costmap inflation zones overlap heavily. With cost regulation enabled, the robot would slow to a crawl everywhere because there are always inflated obstacle costs nearby. The collision monitor (covered later in this module) provides obstacle protection instead.
+
+### 3. Goal approach regulation
+
+As the robot approaches the goal, it decelerates smoothly instead of arriving at full speed:
+
+```yaml
+min_approach_linear_velocity: 0.3         # slow to at least 0.3 m/s near goal
+approach_velocity_scaling_dist: 1.0       # start decelerating 1.0m from goal
+```
+
+Within 1.0 meter of the goal, the robot ramps its speed down. It will not drop below 0.3 m/s — slow enough to stop cleanly, fast enough to not stall on carpet.
+
+<Callout type="see">
+In RViz2, watch the robot approach a goal. About 1 meter out, you will see it visibly decelerate. The <code>/cmd_vel</code> topic's <code>linear.x</code> drops from 0.8 toward 0.3 as the distance to goal shrinks. This is approach regulation in action.
+</Callout>
+
+---
+
+## RPP Configuration on the School Bus
+
+Here is the full controller configuration from `nav2_params.yaml`, broken into groups.
+
+### Core behavior
+
+```yaml
+plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+desired_linear_vel: 0.8          # target speed: 0.8 m/s
+max_angular_accel: 3.2           # maximum angular acceleration (rad/s^2)
+transform_tolerance: 0.1         # accept TF data up to 100ms old
+max_robot_pose_search_dist: 10.0 # search up to 10m along path for closest point
+```
+
+The `desired_linear_vel` of 0.8 m/s is the speed the robot drives on straight sections. This is moderate — about walking pace. On curves, near obstacles, or approaching the goal, the regulated behaviors reduce it.
+
+### Lookahead configuration
+
+```yaml
+lookahead_dist: 1.2              # default lookahead: 1.2 meters
+min_lookahead_dist: 0.6          # never look closer than 0.6m
+max_lookahead_dist: 2.0          # never look farther than 2.0m
+lookahead_time: 1.5              # scale factor when velocity-scaled
+use_velocity_scaled_lookahead_dist: true
+```
+
+With `use_velocity_scaled_lookahead_dist` enabled, the lookahead distance is not fixed at 1.2 meters. Instead, it scales with the robot's current speed: `lookahead = speed * lookahead_time`. At full speed (0.8 m/s), the lookahead is `0.8 * 1.5 = 1.2 m`. When the robot slows to 0.4 m/s for a curve, the lookahead shrinks to `0.4 * 1.5 = 0.6 m` — which equals `min_lookahead_dist`, so it clamps there.
+
+This is smart behavior. When driving fast, look far ahead for smooth tracking. When driving slowly through a tight space, look close for precise maneuvering.
+
+### Curvature options
+
+```yaml
+use_fixed_curvature_lookahead: false
+interpolate_curvature_after_goal: false
+```
+
+These are both false, meaning RPP computes curvature dynamically from the path geometry rather than using a fixed lookahead for curvature estimation, and does not try to extrapolate curvature past the goal point.
+
+### Ackermann constraints
+
+```yaml
+use_rotate_to_heading: false
+allow_reversing: false
+rotate_to_heading_angular_vel: 1.0   # unused because rotate is disabled
+```
+
+Both of these are false because of the school bus's Ackermann steering. More on this in the Ackermann section below.
+
+### Collision detection within the controller
+
+```yaml
+use_collision_detection: false
+max_allowed_time_to_collision_up_to_carrot: 1.0
+```
+
+RPP has its own built-in collision detection, but it is disabled on the school bus. The external collision monitor node handles this instead — it has access to the full 3D pointcloud, not just the 2D costmap.
+
+### Costmap proximity
+
+```yaml
+cost_scaling_dist: 0.3
+cost_scaling_gain: 1.0
+```
+
+These control the cost-regulated velocity scaling, which is currently disabled (`use_cost_regulated_linear_velocity_scaling: false`). If enabled, `cost_scaling_dist` defines how close to costmap obstacles the robot must be before slowing, and `cost_scaling_gain` controls how aggressively it decelerates.
+
+---
+
+## Goal Tolerance
+
+When is the robot "at the goal"? The goal checker decides.
+
+```yaml
+general_goal_checker:
+  plugin: "nav2_controller::SimpleGoalChecker"
+  xy_goal_tolerance: 0.5       # within 50cm of goal position
+  yaw_goal_tolerance: 3.14     # any heading (pi radians = 180 degrees)
+```
+
+The `xy_goal_tolerance` of 0.5 meters means the robot is considered to have reached the goal when its center is within 50 cm of the target position. For a robot the size of a school bus model, this is reasonable — getting within half a meter of a clicked waypoint is good enough for indoor navigation.
+
+The `yaw_goal_tolerance` of 3.14 radians (essentially pi — a full semicircle) means **any heading is accepted**. The robot does not need to face a particular direction at the goal. This is not laziness. It is a necessary workaround.
+
+<Callout type="why">
+The school bus uses double-Ackermann steering, like a car. Cars cannot rotate in place. Nav2's <code>use_rotate_to_heading</code> feature assumes the robot can spin on the spot to face the goal heading, but the school bus cannot do this through Nav2. So we set <code>yaw_goal_tolerance</code> to 3.14 and accept any final orientation. Without this, the robot would reach the goal position but never satisfy the heading requirement, circling endlessly.
+</Callout>
+
+---
+
+## The Ackermann Problem
+
+This deserves its own section because it affects several controller parameters.
+
+### What Ackermann means for Nav2
+
+Most Nav2 tutorials assume a differential-drive robot — one that can rotate in place by spinning its left and right wheels in opposite directions. The school bus cannot do this. It has double-Ackermann steering: the front and rear axles pivot to steer, exactly like a car (but steerable on both ends).
+
+This has three consequences for the controller:
+
+1. **`use_rotate_to_heading: false`** — The controller cannot command a pure rotation to face the path direction before driving. The robot must drive forward and steer simultaneously.
+
+2. **`allow_reversing: false`** — While the hardware supports reverse, the Nav2 integration does not currently handle drive mode switching. Forward only.
+
+3. **`yaw_goal_tolerance: 3.14`** — As explained above, the robot cannot rotate to match a desired heading at the goal.
+
+### The drive mode gap
+
+The school bus hardware *can* rotate in place. The `control_tower_ros2` node has three drive modes, switched via the RC transmitter's Channel 7:
+
+| CH7 value | Drive mode | Behavior |
+|-----------|------------|----------|
+| 1000 | Ackermann | Normal car-like steering |
+| 1500 | Heading | Rotate-then-drive |
+| 2000 | Rotate | Spin in place |
+
+But Nav2 only publishes `cmd_vel`. It has no mechanism to switch the control tower's drive mode. So from Nav2's perspective, the robot is stuck in Ackermann mode — forward-only, no in-place rotation.
+
+A future improvement would be a **drive-mode-switcher node** that watches `cmd_vel` and automatically switches to rotate mode when it detects a pure angular velocity command. This would let Nav2 use `use_rotate_to_heading: true` without knowing about the control tower's internal drive modes.
+
+---
+
+## The cmd_vel Pipeline
+
+The controller's output does not go directly to the motors. It passes through three stages, each adding a layer of safety or smoothness.
+
+```
+Controller (RPP)
+  -> /cmd_vel (raw velocity command)
+  -> velocity_smoother
+  -> /cmd_vel_smoothed (acceleration-limited)
+  -> collision_monitor
+  -> /cmd_vel_nav (safety-checked)
+  -> control_tower_ros2
+  -> motors
+```
+
+### Stage 1: Controller output (/cmd_vel)
+
+The RPP controller publishes raw velocity commands at 20 Hz. These commands can change abruptly — from 0.8 m/s to 0.0 m/s in a single cycle if the robot reaches the goal.
+
+### Stage 2: Velocity smoother (/cmd_vel_smoothed)
+
+The velocity smoother limits how fast the velocity can change. Without it, the robot would jerk violently on starts, stops, and direction changes.
+
+```yaml
+velocity_smoother:
+  smoothing_frequency: 20.0
+  feedback: "OPEN_LOOP"
+  max_velocity: [1.5, 0.0, 1.0]      # [linear.x, linear.y, angular.z]
+  max_accel: [0.5, 0.0, 1.0]         # max acceleration
+  max_decel: [-1.0, 0.0, -1.0]       # max deceleration (negative = braking)
+```
+
+The `max_accel` of 0.5 m/s^2 for linear velocity means it takes the robot `0.8 / 0.5 = 1.6 seconds` to reach full speed from standstill. This is gentle enough to avoid wheel slip on smooth floors.
+
+The `max_decel` of -1.0 m/s^2 allows braking twice as fast as acceleration. This is intentional — you want the robot to stop faster than it starts, especially when obstacles appear.
+
+`feedback: "OPEN_LOOP"` means the smoother assumes its previous output was executed perfectly. It does not read back the robot's actual velocity. This is simpler and avoids feedback loop issues. The alternative, `CLOSED_LOOP`, would subscribe to odometry — but on this robot, a previous feedback wiring mistake caused velocity oscillation, so open-loop is the safe choice.
+
+### Stage 3: Collision monitor (/cmd_vel_nav)
+
+The collision monitor is the last safety gate before motor commands. It subscribes to `/cmd_vel_smoothed` and the Velodyne pointcloud, checking whether the robot is about to collide with something.
+
+```yaml
+collision_monitor:
+  base_frame_id: "base_footprint"
+  odom_frame_id: "odom"
+  transform_tolerance: 0.5
+  source_timeout: 5.0
+  cmd_vel_in_topic: "cmd_vel_smoothed"
+  cmd_vel_out_topic: "cmd_vel_nav"
+```
+
+The collision monitor uses a **footprint approach** observation model:
+
+```yaml
+observation_sources: ["pointcloud"]
+pointcloud:
+  type: "pointcloud"
+  topic: "/velodyne_points"
+  min_height: 0.1
+  max_height: 0.5
+  enabled: true
+
+FootprintApproach:
+  type: "approach"
+  time_before_collision: 1.2    # slow down if collision within 1.2 seconds
+  action_type: "approach"       # gradually slow, not hard stop
+```
+
+The `action_type: "approach"` is important. Instead of slamming the robot to a stop when an obstacle is detected (which would be `action_type: "stop"`), it gradually reduces velocity as the obstacle gets closer. At `time_before_collision: 1.2`, if the robot's current trajectory would hit something within 1.2 seconds, it starts decelerating.
+
+This uses the raw 3D pointcloud from the Velodyne, not the 2D costmap. Points between 0.1 m and 0.5 m height are checked — this filters out ground reflections (below 0.1 m) and irrelevant high objects (above 0.5 m) while catching chair legs, walls, and human ankles.
+
+<Callout type="why">
+The three-stage pipeline separates concerns cleanly. The controller focuses on path tracking. The smoother focuses on physical comfort and motor safety. The collision monitor focuses on obstacle avoidance. Each stage can be tuned independently, and if one is misconfigured, the others still provide protection.
+</Callout>
+
+---
+
+## Observing the Pipeline
+
+You can watch velocity commands flow through all three stages in real time.
+
+### Raw controller output
+
+<CommandBlock command="ros2 topic echo /cmd_vel --once" description="See what the RPP controller is commanding" />
+
+<TerminalOutput title="Controller output while following a straight path">
+{`linear:
+  x: 0.7986
+  y: 0.0
+  z: 0.0
+angular:
+  x: 0.0
+  y: 0.0
+  z: -0.0423`}
+</TerminalOutput>
+
+Nearly full speed (0.8 m/s) with a tiny angular correction — the robot is on a straight segment with a slight leftward drift.
+
+### After smoothing
+
+<CommandBlock command="ros2 topic echo /cmd_vel_smoothed --once" description="See the acceleration-limited velocity" />
+
+<TerminalOutput title="Smoothed output during acceleration from rest">
+{`linear:
+  x: 0.3512
+  y: 0.0
+  z: 0.0
+angular:
+  x: 0.0
+  y: 0.0
+  z: -0.0298`}
+</TerminalOutput>
+
+The controller wants 0.8 m/s, but the smoother is ramping up at 0.5 m/s^2. After about 0.7 seconds from standstill, the output is 0.35 m/s and climbing.
+
+### After collision monitor
+
+<CommandBlock command="ros2 topic echo /cmd_vel_nav --once" description="See the final command sent to motors" />
+
+<TerminalOutput title="Final motor command (no obstacles nearby)">
+{`linear:
+  x: 0.3512
+  y: 0.0
+  z: 0.0
+angular:
+  x: 0.0
+  y: 0.0
+  z: -0.0298`}
+</TerminalOutput>
+
+Identical to the smoothed output — no obstacles detected, so the collision monitor passes the command through unchanged.
+
+### Collision monitor state
+
+<CommandBlock command="ros2 topic echo /collision_monitor_state" description="Check if the collision monitor is actively limiting velocity" />
+
+<TerminalOutput title="Collision monitor state (obstacle detected)">
+{`data:
+- polygon_name: "FootprintApproach"
+  action_type: 3
+  enabled: true`}
+</TerminalOutput>
+
+When this topic publishes, it means the collision monitor is actively intervening — slowing the robot because an obstacle was detected within the 1.2-second time horizon.
+
+---
+
+## Failure Gallery
+
+These are the most common path-following problems and their root causes.
+
+### Robot oscillates side-to-side
+
+**Symptom:** The robot weaves back and forth across the path, never settling on a smooth trajectory. In RViz, the robot's path trace looks like a sine wave.
+
+**Cause:** Lookahead distance is too short for the current speed. The robot overshoots the carrot, corrects, overshoots the other way, corrects again.
+
+**Fix:** Increase `min_lookahead_dist` or `lookahead_time`. On the school bus, raising `min_lookahead_dist` from 0.3 to 0.6 eliminated most oscillation.
+
+### Robot overshoots the goal
+
+**Symptom:** The robot drives past the goal point before stopping, then may try to reverse or circle back.
+
+**Cause:** `approach_velocity_scaling_dist` is too small (the robot doesn't start slowing soon enough), or `min_approach_linear_velocity` is too high (it arrives too fast to stop in time).
+
+**Fix:** Increase `approach_velocity_scaling_dist` to give the robot more room to decelerate. On the school bus, 1.0 meter works well. If the robot still overshoots, reduce `min_approach_linear_velocity` from 0.3 to 0.2.
+
+### Robot stops far from obstacles
+
+**Symptom:** The robot decelerates and stops 1-2 meters away from any obstacle, even when the planned path has clearance.
+
+**Cause:** `time_before_collision` in the collision monitor is too high. At 0.8 m/s with a 2.0-second collision horizon, the robot starts braking 1.6 meters away from any obstacle.
+
+**Fix:** Reduce `time_before_collision`. The current value of 1.2 seconds provides a 0.96-meter buffer at full speed, which is a good balance. Going below 0.8 seconds is risky for a robot this size.
+
+### Robot creeps at constant low speed
+
+**Symptom:** The robot never reaches `desired_linear_vel`. It drives at 0.25 m/s everywhere.
+
+**Cause:** `use_regulated_linear_velocity_scaling` is reducing speed because the path curvature is always below `regulated_linear_scaling_min_radius`. This happens in tight indoor spaces where the planner produces many small curves.
+
+**Fix:** Reduce `regulated_linear_scaling_min_radius`. At 0.9 meters, only genuinely tight curves trigger slowdown. If the robot is still too slow, check if `use_cost_regulated_linear_velocity_scaling` is accidentally enabled — that would cause additional slowdown in costmap-dense areas.
+
+### Robot follows path but heading is wrong at goal
+
+**Symptom:** The robot reaches the goal position but is facing the wrong direction. Nav2 reports success.
+
+**Cause:** This is expected behavior with `yaw_goal_tolerance: 3.14`. The robot accepts any heading at the goal because it cannot rotate in place via Nav2.
+
+**Fix:** This is not a bug. If precise final heading is required, the drive-mode-switcher node described in the Ackermann section would need to be implemented first.
+
+---
+
+## Try It
+
+### Level 1: Compare the three cmd_vel topics
+
+Open three terminals and run one echo command in each:
+
+<CommandBlock command="ros2 topic echo /cmd_vel --once" description="Raw controller output" />
+<CommandBlock command="ros2 topic echo /cmd_vel_smoothed --once" description="After velocity smoother" />
+<CommandBlock command="ros2 topic echo /cmd_vel_nav --once" description="After collision monitor" />
+
+Send a Nav2 goal and capture all three at the same moment. Compare `linear.x` across the three topics. During acceleration, the smoother will show a lower value than the controller. Near obstacles, the collision monitor will show a lower value than the smoother. On open straights with the robot at cruising speed, all three should be nearly identical.
+
+### Level 2: Trigger curvature regulation
+
+Find or create a path that includes a sharp turn (place the Nav2 goal around a corner from the robot). Watch `/cmd_vel` during the turn:
+
+<CommandBlock command="ros2 topic echo /cmd_vel" description="Watch velocity change through a curve" />
+
+On the straight approach, `linear.x` should be near 0.8. As the robot enters the curve, it should drop — potentially to 0.25 if the curve radius is below 0.9 meters. The `angular.z` value will increase as the robot steers through the turn. After the curve, `linear.x` ramps back up as the path straightens.
+
+### Level 3: Tune the lookahead distance
+
+This exercise demonstrates the oscillation-vs-corner-cutting tradeoff.
+
+1. Set `min_lookahead_dist: 0.3` and `max_lookahead_dist: 0.5` in `nav2_params.yaml`
+2. Rebuild: `colcon build --packages-select nav2_schoolbus`
+3. Relaunch and send the robot along a path with both straight sections and turns
+4. Observe: the robot should track tight corners accurately but oscillate on straights
+
+Now try the opposite:
+
+1. Set `min_lookahead_dist: 1.5` and `max_lookahead_dist: 3.0`
+2. Rebuild and relaunch
+3. Observe: smooth straights but the robot cuts corners badly
+
+Finally, restore the defaults (`min: 0.6`, `max: 2.0`) and notice how they balance both behaviors. This is the fundamental tradeoff of Pure Pursuit — there is no perfect lookahead, only a best compromise for your environment.
+
+---
+
+**Next module:** [M10: Motor Control](/modules/10-motor-control) — How `cmd_vel_nav` becomes physical wheel motion through the control tower's double-Ackermann kinematics.

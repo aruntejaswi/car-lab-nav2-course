@@ -1,0 +1,391 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M11: Behavior Tree
+
+The brain behind every navigation goal. The behavior tree decides what to do, when to replan, and how to recover from failure.
+
+---
+
+## Prerequisites
+
+This module builds on concepts from:
+
+- **M8: Path Planning** — how the planner computes a global path
+- **M9: Path Following** — how the controller tracks that path
+
+You should have a working SLAM + Nav2 stack that can accept and execute navigation goals before starting this module.
+
+---
+
+## What Is a Behavior Tree?
+
+When you send a navigation goal in RViz, something has to orchestrate the entire process: call the planner, hand the path to the controller, monitor progress, detect failures, trigger recovery behaviors, and decide when to give up. That something is a **behavior tree** (BT).
+
+A behavior tree is a hierarchical decision-making structure. It replaces the traditional state machine approach with something more modular. Instead of drawing arrows between states (planning, executing, recovering, aborting) and trying to account for every possible transition, you build a tree of small, composable nodes.
+
+The tree is **tick-based**. On every tick (every iteration of the main loop), the root node sends a tick signal down through its children. Each node responds with one of three statuses:
+
+- **SUCCESS** — the task completed
+- **FAILURE** — the task failed
+- **RUNNING** — the task is still in progress, tick me again next time
+
+The tick propagates down and statuses propagate back up. The root node's final status tells the system whether the overall navigation goal has succeeded, failed, or is still in progress.
+
+<Callout type="why">
+Why not a state machine? State machines work for simple robots, but they scale poorly. A state machine with 5 states has 20 possible transitions. With 10 states, you have 90. Every new behavior requires updating transition logic everywhere. Behavior trees avoid this: you add a new branch and the rest of the tree is unaffected. This is why Nav2 — and most modern robotics frameworks — chose behavior trees.
+</Callout>
+
+---
+
+## Key BT Node Types
+
+Every behavior tree is assembled from five types of nodes. Understanding these five types is enough to read any Nav2 BT.
+
+### Sequence
+
+A sequence node runs its children from left to right. If a child returns SUCCESS, it moves to the next child. If any child returns FAILURE, the entire sequence fails immediately. Think of it as a checklist: every item must succeed for the whole sequence to succeed.
+
+```
+Sequence
+  ├── ComputePathToPose   (plan a path)
+  └── FollowPath           (drive along it)
+```
+
+If `ComputePathToPose` fails (no valid path exists), `FollowPath` never runs.
+
+### Fallback (Selector)
+
+A fallback node is the opposite of a sequence. It runs children left to right, but it stops at the **first success**. If a child fails, it tries the next one. Think of it as a list of alternatives: try Plan A, if that fails try Plan B, if that fails try Plan C.
+
+```
+Fallback
+  ├── FollowPath       (try following the current path)
+  ├── ComputeNewPath   (if following fails, replan)
+  └── Wait             (if replanning fails, wait)
+```
+
+### Action
+
+Action nodes are the leaves of the tree — they do actual work. In Nav2, each action node calls a ROS2 action server. The most important action nodes are:
+
+| Action Node | Action Server | What It Does |
+|---|---|---|
+| `ComputePathToPose` | `/compute_path_to_pose` | Calls the planner (M8) |
+| `FollowPath` | `/follow_path` | Calls the controller (M9) |
+| `BackUp` | `/backup` | Drives backward |
+| `Wait` | `/wait` | Pauses for a duration |
+| `DriveOnHeading` | `/drive_on_heading` | Drives forward through stuck spots |
+
+### Decorator
+
+Decorator nodes wrap a single child and modify its behavior. They act as filters or controllers.
+
+- **RateController** — only ticks its child at a specified frequency (e.g., replan at 1 Hz, not every tick)
+- **DistanceController** — only ticks its child after the robot has moved a certain distance
+- **GoalUpdatedController** — re-ticks its child if the navigation goal changes
+
+### Condition
+
+Condition nodes check something and return SUCCESS or FAILURE immediately, without doing any work. They are the "if" statements of the tree.
+
+- **IsPathValid** — checks whether the current path is still collision-free in the costmap
+- **GoalUpdated** — checks whether the navigation goal has changed since the last tick
+- **IsBatteryLow** — checks battery level (not used on the school bus, but available)
+
+---
+
+## The School Bus Behavior Tree
+
+The school bus uses a specific behavior tree chosen for Ackermann steering constraints and indoor operation:
+
+```yaml
+default_nav_to_pose_bt_xml: navigate_w_replanning_only_if_path_becomes_invalid.xml
+```
+
+This BT file ships with Nav2 at `/opt/ros/jazzy/share/nav2_bt_navigator/behavior_trees/`. The name says exactly what it does: **only replan if the current path becomes invalid**.
+
+### Why this BT was chosen
+
+Many default Nav2 BTs replan on a timer — every 1 or 2 seconds, the planner computes a new path regardless of whether the current one is still good. This works well for differential-drive robots that can turn quickly, but on the school bus it causes problems. The Ackermann steering has a minimum turning radius, and frequent replanning can cause the path to oscillate between slightly different routes, making the controller jerk the steering back and forth.
+
+By only replanning when the path is actually blocked, the controller gets a stable path to follow. The steering stays smooth. The robot only recalculates when it genuinely needs to.
+
+### How the BT works
+
+Here is the logical flow, simplified:
+
+```
+Root (Sequence)
+├── ComputePathToPose          → plan initial path
+└── MonitorAndFollow (Parallel)
+    ├── PathValidityChecker    → continuously check if path is blocked
+    └── FollowPath             → drive along the path
+        
+If path becomes invalid:
+  └── Recovery (Fallback)
+      ├── Replan + FollowPath  → compute new path and follow it
+      └── RecoveryBehaviors    → back up, wait, try again
+          ├── BackUp
+          ├── Wait
+          └── DriveOnHeading
+```
+
+The key is the **Parallel** node. While `FollowPath` is driving the robot, `PathValidityChecker` is simultaneously checking the costmap. If a new obstacle blocks the path, the parallel node triggers replanning. If the path stays clear, the robot drives all the way to the goal without ever calling the planner again.
+
+<Callout type="see">
+When navigation is active, watch the <code>/plan</code> topic in RViz. With this BT, you will see the path drawn once at the start and it stays unchanged until an obstacle blocks it. If you step in front of the robot, the path disappears briefly and a new one appears around you.
+</Callout>
+
+---
+
+## bt_navigator Configuration
+
+Here is the full `bt_navigator` section from `nav2_params.yaml`:
+
+```yaml
+bt_navigator:
+    ros__parameters:
+        global_frame: map
+        robot_base_frame: base_footprint
+        odom_topic: /odometry/local
+        bt_loop_duration: 10
+        default_server_timeout: 20
+        wait_for_service_timeout: 1000
+        action_server_result_timeout: 900.0
+        navigators: ["navigate_to_pose", "navigate_through_poses"]
+        navigate_to_pose:
+            plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+        navigate_through_poses:
+            plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+        default_nav_to_pose_bt_xml: "/opt/ros/jazzy/share/nav2_bt_navigator/behavior_trees/navigate_w_replanning_only_if_path_becomes_invalid.xml"
+        default_nav_through_poses_bt_xml: "/opt/ros/jazzy/share/nav2_bt_navigator/behavior_trees/navigate_w_replanning_only_if_path_becomes_invalid.xml"
+        error_code_names:
+            - compute_path_error_code
+            - follow_path_error_code
+```
+
+### Parameter breakdown
+
+**`global_frame: map`** — the BT navigator works in the map frame. All goals are specified in map coordinates.
+
+**`robot_base_frame: base_footprint`** — used to look up the robot's current position in the TF tree.
+
+**`odom_topic: /odometry/local`** — the fused odometry from the EKF (M5). The BT navigator uses this for progress checking and goal distance calculations.
+
+**`bt_loop_duration: 10`** — the target loop duration in milliseconds. The BT is ticked at roughly 100 Hz. If a tick takes longer than 10 ms, the system logs a warning but continues.
+
+**`default_server_timeout: 20`** — how long (in seconds) an action node waits for its server to respond before reporting failure. If the planner takes more than 20 seconds to compute a path, the BT considers it failed and moves to recovery.
+
+**`wait_for_service_timeout: 1000`** — how long (in milliseconds) to wait for action servers to become available at startup.
+
+**`action_server_result_timeout: 900.0`** — maximum time (in seconds) to wait for a navigation result. At 900 seconds (15 minutes), this is deliberately generous for long indoor routes.
+
+**`error_code_names`** — the BT tracks error codes from the planner and controller separately, which helps distinguish "no path exists" from "controller lost the path."
+
+---
+
+## Recovery Behaviors
+
+When navigation fails — the path is blocked, the robot is stuck, the planner cannot find a route — the behavior tree triggers **recovery behaviors**. These are defined in the `behavior_server` section of `nav2_params.yaml`:
+
+```yaml
+behavior_server:
+    ros__parameters:
+        behavior_plugins: ["backup", "drive_on_heading", "assisted_teleop", "wait"]
+        backup:
+            plugin: "nav2_behaviors::BackUp"
+        drive_on_heading:
+            plugin: "nav2_behaviors::DriveOnHeading"
+        wait:
+            plugin: "nav2_behaviors::Wait"
+        assisted_teleop:
+            plugin: "nav2_behaviors::AssistedTeleop"
+        local_frame: odom
+        global_frame: map
+        robot_base_frame: base_footprint
+        transform_tolerance: 0.9
+        simulate_ahead_time: 2.0
+```
+
+### What each recovery does
+
+**BackUp** — the robot reverses 0.15 meters at 0.025 m/s. These values are deliberately tiny. The school bus weighs several kilograms and has limited rear visibility, so backing up is slow and short. The goal is to nudge the robot just far enough to clear a tight spot, not to drive blindly backward.
+
+**Wait** — the robot stops and waits 5 seconds. This handles the case where a person is walking through the robot's path. Rather than aggressively replanning around them, the robot pauses and hopes they move on. In a school environment, this is often the right behavior.
+
+**DriveOnHeading** — the robot drives forward on its current heading. This is useful when the robot is stuck in a local minimum — the costmap says there is no clear path, but driving forward a short distance would actually clear the obstruction.
+
+**AssistedTeleop** — allows a human operator to take over via the joystick while Nav2 provides collision avoidance. The robot blends manual control with safety checks from the local costmap.
+
+### No Spin recovery
+
+Notice what is **not** in the plugin list: `Spin`. The default Nav2 recovery set includes a spin behavior where the robot rotates in place to clear its surroundings. But the school bus uses Ackermann steering — it physically cannot rotate in place via Nav2 commands. Including the Spin plugin would cause the recovery behavior to hang forever, waiting for a rotation that never completes.
+
+<Callout type="warning">
+If you see examples online that include <code>spin</code> in the behavior_plugins list, do not add it to the school bus config. Ackermann robots cannot spin in place. The control tower does have a rotate drive mode (via CH7/sw_c on the joystick), but Nav2 does not know how to trigger drive mode switches. Including Spin will cause recovery to stall indefinitely.
+</Callout>
+
+---
+
+## Lifecycle Management
+
+Before the behavior tree can run, every Nav2 node must be in the **active** lifecycle state. Nav2 uses ROS2 managed (lifecycle) nodes, which transition through four states:
+
+```
+Unconfigured → Inactive → Active → Finalized
+```
+
+The lifecycle manager handles these transitions automatically when `autostart: true` is set. The sequence for the navigation stack is:
+
+1. `controller_server` — configures and activates
+2. `smoother_server` — configures and activates
+3. `planner_server` — configures and activates
+4. `behavior_server` — configures and activates
+5. `velocity_smoother` — configures and activates
+6. `collision_monitor` — configures and activates
+7. **`bt_navigator`** — configures and activates **last**
+8. `waypoint_follower` — configures and activates
+
+The `bt_navigator` activates near the end because it depends on the planner and controller servers being ready. If it activated first, its action nodes would fail immediately because the servers they call do not exist yet.
+
+### The 25-second delay
+
+As covered in M6, the entire navigation stack is wrapped in a `TimerAction` with a 25-second delay. This ensures SLAM Toolbox has published the `map -> odom` TF before any Nav2 node tries to use the `map` frame. Without this delay, lifecycle activation fails with transform errors.
+
+### Checking lifecycle state
+
+You can query the lifecycle state of any Nav2 node at any time:
+
+<CommandBlock command="ros2 lifecycle get /bt_navigator" description="Check if the behavior tree navigator is active" />
+
+<TerminalOutput title="Lifecycle state: bt_navigator (healthy)">
+{`active [3]`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 lifecycle get /controller_server" description="Check if the controller server is active" />
+
+<TerminalOutput title="Lifecycle state: controller_server (healthy)">
+{`active [3]`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 lifecycle get /planner_server" description="Check if the planner server is active" />
+
+<TerminalOutput title="Lifecycle state: planner_server (healthy)">
+{`active [3]`}
+</TerminalOutput>
+
+To see all possible transitions for a node:
+
+<CommandBlock command="ros2 lifecycle list /bt_navigator" description="List all lifecycle transitions for bt_navigator" />
+
+<TerminalOutput title="Available lifecycle transitions for bt_navigator">
+{`- configure [1]
+	Start: unconfigured
+	Goal:  inactive
+- cleanup [2]
+	Start: inactive
+	Goal:  unconfigured
+- activate [3]
+	Start: inactive
+	Goal:  active
+- deactivate [4]
+	Start: active
+	Goal:  inactive
+- shutdown [5]
+	Start: unconfigured
+	Goal:  finalized
+- shutdown [6]
+	Start: inactive
+	Goal:  finalized
+- shutdown [7]
+	Start: active
+	Goal:  finalized`}
+</TerminalOutput>
+
+If any node is stuck in `unconfigured` or `inactive`, navigation goals will be silently ignored. Always check lifecycle state first when debugging "nothing happens when I click Nav2 Goal."
+
+---
+
+## Inspecting the BT Configuration
+
+You can verify which behavior tree file the navigator is using at runtime:
+
+<CommandBlock command="ros2 param get /bt_navigator default_nav_to_pose_bt_xml" description="Show which BT XML file is loaded" />
+
+<TerminalOutput title="BT XML parameter">
+{`String value is: /opt/ros/jazzy/share/nav2_bt_navigator/behavior_trees/navigate_w_replanning_only_if_path_becomes_invalid.xml`}
+</TerminalOutput>
+
+This confirms the navigator is using the replan-only-if-invalid tree, not one of the periodic replanning alternatives.
+
+---
+
+## Failure Gallery
+
+### Lifecycle never reaches active
+
+**Symptom:** `ros2 lifecycle get /bt_navigator` returns `unconfigured [1]` or `inactive [2]` long after launch.
+
+**Cause:** SLAM is not publishing the `map -> odom` transform. Without the `map` frame, the costmaps cannot initialize, and the lifecycle manager gets stuck waiting for costmap activation before moving on to bt_navigator.
+
+**Fix:** Check that SLAM Toolbox is running and has received scans. If it is running but the map frame does not exist, the 25-second delay in `bringup_launch.py` may not be long enough. Increase the `period` value in the `TimerAction` to 35 or 40 seconds. On cold boot, the Pi's CPU may be slower than expected.
+
+### Recovery behaviors loop forever
+
+**Symptom:** The robot backs up, waits, backs up again, waits again, in an endless cycle. It never reaches the goal and never gives up.
+
+**Cause:** The obstacle blocking the path cannot be cleared by a 0.15-meter backup. Maybe it is a wall, or a large piece of furniture. The recovery behavior succeeds (it backs up and waits), so the BT tries to replan, fails again, and loops back to recovery.
+
+**Fix:** Either remove the obstacle or cancel the navigation goal (`ros2 action send_goal /navigate_to_pose ... --cancel`). Consider whether the goal itself is reachable — if it is inside a wall or behind a permanent obstacle, no amount of recovery will help. You can also increase the backup distance in `nav2_params.yaml`, but be cautious: backing up farther means more blind driving in reverse.
+
+### "Where is the Spin recovery?"
+
+**Symptom:** Someone follows a Nav2 tutorial and adds `spin` to the `behavior_plugins` list. The robot gets stuck during recovery and never moves. The BT waits for the Spin action to complete, but the action never finishes because the Ackermann steering cannot achieve pure rotation through `/cmd_vel`.
+
+**Fix:** Remove `spin` from the behavior_plugins list. This is not a bug — it is a platform constraint. Ackermann robots need a different recovery strategy than differential-drive robots. The school bus config already has the correct set: backup, drive_on_heading, wait, and assisted_teleop.
+
+---
+
+## Try It
+
+### Level 1: Confirm the BT is loaded
+
+With the full stack running (SLAM + Nav2), verify the behavior tree configuration.
+
+<CommandBlock command="ros2 lifecycle get /bt_navigator" description="Verify bt_navigator is active" />
+
+<CommandBlock command="ros2 param get /bt_navigator default_nav_to_pose_bt_xml" description="Check which BT file is in use" />
+
+Confirm that the lifecycle state is `active [3]` and the BT XML path points to the replan-only-if-invalid file. If the state is not active, check SLAM and review the lifecycle troubleshooting section above.
+
+### Level 2: Trigger a recovery behavior
+
+Send a navigation goal to a location that is partially blocked by a movable obstacle (a chair, a box). Watch what happens when the robot reaches the obstruction:
+
+1. Open RViz2 and click "Nav2 Goal" to set a goal behind the obstacle
+2. Watch the terminal output — you should see recovery behavior log messages
+3. Observe the robot back up and wait
+4. While it is waiting, move the obstacle out of the way
+5. The robot should replan around the now-clear space and continue to the goal
+
+This exercise demonstrates the full BT cycle: plan, follow, detect blockage, recover, replan, follow again.
+
+### Level 3: Compare behavior trees
+
+Nav2 ships with several BT alternatives. Read the names in the behavior_trees directory:
+
+<CommandBlock command="ls /opt/ros/jazzy/share/nav2_bt_navigator/behavior_trees/" description="List all available Nav2 behavior tree XML files" />
+
+Pick a different BT file (for example, `navigate_w_replanning_and_recovery.xml`) and change the `default_nav_to_pose_bt_xml` parameter in `nav2_params.yaml` to point to it. Rebuild and relaunch. Send the same navigation goal and observe the differences:
+
+- Does the robot replan more frequently?
+- Does the path flicker in RViz as new plans are computed?
+- Does the steering oscillate more with periodic replanning?
+
+After testing, switch back to `navigate_w_replanning_only_if_path_becomes_invalid.xml`. This exercise illustrates why the BT choice matters for Ackermann platforms.
+
+---
+
+**Next module:** [M12: Integration](/modules/12-integration) — Putting every module together into a single end-to-end navigation run, from power-on to autonomous goal completion.

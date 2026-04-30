@@ -1,0 +1,278 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M3: TF — The Coordinate Frame Tree
+
+Every sensor sees the world from a different position. TF2 connects them all.
+
+---
+
+## Why TF Exists
+
+The school bus has a LiDAR mounted 93.8 cm above the ground, an IMU at 69.9 cm, and a camera at 66.1 cm. Each sensor measures the world relative to itself. When the LiDAR reports "there's a wall 2.0 meters away," it means 2.0 meters from the LiDAR — not from the robot's base, not from the map origin.
+
+That creates a problem. Nav2 plans paths in the `map` frame. KISS-ICP matches laser scans in the `odom` frame. The LiDAR publishes points in the `3d_lidar_link` frame. The IMU reports acceleration in the `imu_link` frame. For any of these systems to work together, something needs to convert coordinates between frames.
+
+That something is **TF2** (Transform Framework 2). TF2 maintains a tree of coordinate transforms so that any ROS2 node can ask: "Where is this point in frame X expressed in frame Y?" and get an answer, even if the two frames are separated by multiple intermediate transforms.
+
+Without TF2, every node that consumes sensor data would need to know the exact physical offset of every sensor and manually apply rotation matrices and translation vectors. Every time you moved a sensor by a centimeter, you'd have to update every node that uses it. TF2 centralizes this — measure each sensor's position once, publish it, and every node in the system can use it automatically.
+
+<Callout type="why">
+  TF2 is not optional infrastructure — it is the backbone of every robotics stack built on ROS2. A single missing transform breaks the entire pipeline. If KISS-ICP cannot look up where the LiDAR is, it cannot match scans. If SLAM cannot get odometry transforms, it cannot build a map. If Nav2 cannot find the map frame, it cannot plan a path. Every module in this course depends on TF working correctly.
+</Callout>
+
+---
+
+## The Schoolbus TF Tree
+
+Here is the actual TF tree for the school bus. Every arrow represents a coordinate transform — a translation and rotation that converts points from one frame to another.
+
+```
+map
+ └── odom                    [SLAM Toolbox publishes map→odom]
+      └── base_footprint     [EKF publishes odom→base_footprint]
+           └── base_link     [URDF: identity transform]
+                ├── 3d_lidar_link    [URDF: (0.178, 0.0, 0.938)]
+                ├── imu_link         [URDF: (0.0, 0.0, 0.699)]
+                ├── route_cam_link   [URDF: (0.339, 0.0, 0.661)]
+                ├── fl_steering_link [URDF: front-left wheel]
+                ├── fr_steering_link [URDF: front-right wheel]
+                ├── bl_steering_link [URDF: back-left wheel]
+                └── br_steering_link [URDF: back-right wheel]
+```
+
+Reading this tree from the bottom up:
+
+- **Sensor frames** (`3d_lidar_link`, `imu_link`, etc.) describe where each sensor sits on the physical robot, relative to `base_link`. These never change — the LiDAR is always bolted to the same mount.
+- **`base_link` to `base_footprint`** is an identity transform (zero translation, zero rotation). They represent the same point. `base_footprint` exists because Nav2 expects a ground-plane frame by convention.
+- **`odom` to `base_footprint`** is the robot's estimated position within the odometry frame. This changes at ~10 Hz as the robot moves.
+- **`map` to `odom`** is the drift correction published by SLAM Toolbox. As odometry accumulates error, SLAM adjusts this transform to keep the robot correctly placed on the map.
+
+<Callout type="see">
+  In RViz2, set the Fixed Frame to <code>map</code> and enable the TF display. You will see coordinate axes drawn at each frame — red for X (forward), green for Y (left), blue for Z (up). The sensor frames cluster around the robot body, while <code>odom</code> and <code>map</code> sit at the world origin until the robot moves.
+</Callout>
+
+---
+
+## Static vs Dynamic Transforms
+
+TF2 publishes transforms on two separate topics, and the distinction matters.
+
+### Static Transforms (`/tf_static`)
+
+Static transforms are published **once** and latched — every new subscriber receives them immediately without waiting for the next publish cycle. These describe fixed physical relationships that never change at runtime.
+
+On the school bus, all sensor mounts are static. The LiDAR is always at (0.178, 0.0, 0.938) meters relative to `base_link`. The IMU is always at (0.0, 0.0, 0.699). These come from the URDF (the robot's 3D model file) and are published by `robot_state_publisher`.
+
+Here are the actual static transforms captured from the running robot:
+
+```yaml
+- header:
+    frame_id: base_link
+  child_frame_id: 3d_lidar_link
+  transform:
+    translation: {x: 0.1778, y: 0.0, z: 0.9383}
+    rotation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+
+- header:
+    frame_id: base_footprint
+  child_frame_id: base_link
+  transform:
+    translation: {x: 0.0, y: 0.0, z: 0.0}
+    rotation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+
+- header:
+    frame_id: base_link
+  child_frame_id: imu_link
+  transform:
+    translation: {x: 0.0, y: 0.0, z: 0.6992}
+    rotation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+```
+
+A few things to notice:
+
+- **Rotation `{x: 0, y: 0, z: 0, w: 1}`** is the identity quaternion — it means no rotation. All sensors face the same direction as the robot body. If the LiDAR were mounted sideways or upside down, you would see non-identity rotation values here.
+- **`base_footprint → base_link`** has zero translation and identity rotation — they are the same point. `base_footprint` exists purely as a Nav2 convention (a frame projected onto the ground plane).
+- **Translation values are in meters.** The LiDAR sits 17.8 cm forward (x), centered laterally (y = 0), and 93.8 cm above the base (z).
+
+### Dynamic Transforms (`/tf`)
+
+Dynamic transforms change over time and must be published continuously. If a publisher stops, the transform goes stale and other nodes will report timeout errors.
+
+On the school bus, two transforms are dynamic:
+
+| Transform | Publisher | Rate | What it represents |
+|-----------|-----------|------|--------------------|
+| `odom → base_footprint` | EKF (robot_localization) | ~10 Hz | Robot's estimated position and heading within the odometry frame |
+| `map → odom` | SLAM Toolbox | ~1-5 Hz | Drift correction — the offset between the map and odometry origins |
+
+<Callout type="why">
+  The reason <code>map → odom</code> exists as a separate transform (instead of publishing <code>map → base_footprint</code> directly) is a deliberate design choice called the "odom frame" pattern. Odometry is smooth but drifts over time. SLAM corrections are accurate but can jump. By splitting them into two transforms, the robot's motion stays smooth in the <code>odom</code> frame (good for local planning and collision avoidance), while the <code>map</code> frame stays globally accurate (good for reaching distant goals). Nav2 relies on this split.
+</Callout>
+
+---
+
+## robot_state_publisher
+
+The `robot_state_publisher` node is what makes the static half of the TF tree exist. It is the single most important prerequisite for everything else.
+
+**What it does:**
+1. Reads the URDF file — the school bus model has 109 links and joints describing every physical component
+2. Publishes all **fixed joint** transforms to `/tf_static` (sensor mounts, structural links)
+3. Subscribes to `/joint_states` for **movable joints** (the four steering angles) and publishes those to `/tf`
+
+**What it runs on:** The Raspberry Pi. It must be launched manually — it is NOT included in `ractor-sensors.service`.
+
+<CommandBlock command="ros2 launch schoolbus_urdf schoolbus.launch.py" description="Launch robot_state_publisher on the Pi" />
+
+**Why the launch order matters:** `robot_state_publisher` must start BEFORE `bringup_launch.py` on the laptop. Here is the dependency chain:
+
+1. `robot_state_publisher` publishes `3d_lidar_link` frame to `/tf_static`
+2. KISS-ICP needs `3d_lidar_link` to transform incoming point clouds → produces `odom → base_footprint`
+3. SLAM Toolbox needs `odom → base_footprint` to compute laser scan poses → produces `map → odom`
+4. Nav2 needs `map` frame to activate costmaps, planner, and controller
+
+If step 1 doesn't happen, steps 2-4 all fail in sequence.
+
+<Callout type="warning">
+  Forgetting to launch <code>robot_state_publisher</code> is the number one cause of bringup failures. The error messages that result can be confusing — KISS-ICP reports "Invalid frame ID" for <code>3d_lidar_link</code>, then 25 seconds later Nav2 fails to activate because the <code>map</code> frame doesn't exist. The root cause is always the same: no <code>robot_state_publisher</code> means no static frames, and everything downstream collapses.
+</Callout>
+
+---
+
+## Hands-on: TF Commands
+
+ROS2 provides command-line tools for inspecting TF transforms in real time. These are essential for debugging.
+
+### tf2_echo — Read a specific transform
+
+`tf2_echo` continuously prints the transform between two frames. The syntax is `tf2_echo <target_frame> <source_frame>`, which answers: "Where is `source_frame` expressed in `target_frame`?"
+
+<CommandBlock command="ros2 run tf2_ros tf2_echo map odom" description="Show the SLAM drift correction transform" />
+
+<TerminalOutput title="tf2_echo map odom (SLAM just started)">
+{`At time 0.0
+- Translation: [0.000, 0.000, 0.000]
+- Rotation: in Quaternion [0.000, 0.000, 0.000, 1.000]
+- Rotation: in RPY (radian) [0.000, 0.000, 0.000]
+- Rotation: in RPY (degree) [0.000, 0.000, 0.000]`}
+</TerminalOutput>
+
+This is identity — no correction yet. When SLAM first starts, odometry and map origins are the same. As the robot drives and odometry drifts, you will see this transform change as SLAM compensates.
+
+<CommandBlock command="ros2 run tf2_ros tf2_echo odom base_footprint" description="Show the robot's position in the odom frame" />
+
+<TerminalOutput title="tf2_echo odom base_footprint (robot has moved slightly)">
+{`At time 0.0
+- Translation: [0.046, 0.002, 0.000]
+- Rotation: in Quaternion [0.000, 0.000, -0.003, 1.000]
+- Rotation: in RPY (radian) [0.000, 0.000, -0.006]
+- Rotation: in RPY (degree) [0.000, 0.000, -0.319]`}
+</TerminalOutput>
+
+The robot has moved 4.6 cm forward (x), 2 mm to the left (y), and rotated 0.3 degrees clockwise (negative yaw). This is typical of slight motion during startup — vibrations from the motors initializing.
+
+<CommandBlock command="ros2 run tf2_ros tf2_echo base_footprint 3d_lidar_link" description="Show the LiDAR's position relative to the robot base" />
+
+<TerminalOutput title="tf2_echo base_footprint 3d_lidar_link (static)">
+{`At time 0.0
+- Translation: [0.178, 0.000, 0.938]
+- Rotation: in Quaternion [0.000, 0.000, 0.000, 1.000]
+- Rotation: in RPY (radian) [0.000, 0.000, 0.000]
+- Rotation: in RPY (degree) [0.000, 0.000, 0.000]`}
+</TerminalOutput>
+
+This is a static transform — it will never change. The LiDAR sits 17.8 cm forward of the robot's center and 93.8 cm above the ground. No rotation means it faces straight forward.
+
+<Callout type="see">
+  Notice how the static transform prints "At time 0.0" — static transforms have no timestamp because they are always valid. Dynamic transforms show actual timestamps that update each cycle.
+</Callout>
+
+### tf2_monitor — Survey all transforms at once
+
+<CommandBlock command="ros2 run tf2_ros tf2_monitor" description="Monitor all active transforms and their publish rates" />
+
+`tf2_monitor` prints a table showing every active transform, its publisher rate, and the age of the most recent update. Run it for about 10 seconds and then press Ctrl+C. You will see:
+
+- **Static transforms** (sensor frames) listed with a note that they are static
+- **`odom → base_footprint`** updating at ~10 Hz (matching KISS-ICP's output rate)
+- **`map → odom`** updating at a lower rate (SLAM doesn't need to correct as often)
+
+This is the fastest way to check that all expected transforms are being published.
+
+---
+
+## Debugging TF Failures
+
+When TF breaks, the error messages point you directly to the problem — if you know how to read them.
+
+### Failure: "Invalid frame ID"
+
+<TerminalOutput title="KISS-ICP — frame does not exist">
+{`[kiss_icp_node] [WARN] Failed to find tf. Reason=Invalid frame ID "3d_lidar_link"
+  passed to canTransform argument source_frame - frame does not exist`}
+</TerminalOutput>
+
+**What it means:** KISS-ICP asked TF2 "does the frame `3d_lidar_link` exist?" and TF2 said no. The frame has never been published to `/tf_static`.
+
+**Root cause:** `robot_state_publisher` is not running on the Pi.
+
+**Fix:** SSH into the Pi and launch `robot_state_publisher`. Then restart KISS-ICP — it caches TF lookup failures and may not automatically recover even after the frame appears.
+
+<Callout type="warning">
+  KISS-ICP caches TF failures internally. Even after <code>robot_state_publisher</code> starts and the frame becomes available, KISS-ICP may continue reporting errors. If you started <code>bringup_launch.py</code> before <code>robot_state_publisher</code>, the safest fix is to kill and relaunch the entire bringup. Always start <code>robot_state_publisher</code> first.
+</Callout>
+
+### Failure: "Timed out waiting for transform"
+
+<TerminalOutput title="Nav2 — transform timeout">
+{`[component_container_isolated] [INFO] Timed out waiting for transform from
+  base_footprint to map to become available, tf error: Invalid frame ID "map"
+  passed to canTransform argument target_frame - frame does not exist`}
+</TerminalOutput>
+
+**What it means:** Nav2 is trying to look up the transform from `base_footprint` to `map`, but the `map` frame does not exist yet.
+
+**Root cause:** SLAM Toolbox hasn't published `map → odom` yet. This can happen if:
+- SLAM hasn't been running long enough (it needs a few seconds after activation)
+- SLAM itself failed because odometry wasn't available (chain reaction from missing `robot_state_publisher`)
+- The `slam` launch argument wasn't set to `True`
+
+**Fix:** Check the dependency chain from the bottom up. Is `robot_state_publisher` running? Is KISS-ICP producing odometry? Is SLAM Toolbox active? The first broken link in the chain is your root cause.
+
+### Quick diagnostic checklist
+
+When TF is broken, run these commands in order:
+
+<CommandBlock command="ros2 topic echo /tf_static --once" description="Check if static frames exist" />
+
+If this returns nothing, `robot_state_publisher` is not running.
+
+<CommandBlock command="ros2 run tf2_ros tf2_echo odom base_footprint" description="Check if odometry TF is being published" />
+
+If this times out, KISS-ICP or EKF is not producing odometry.
+
+<CommandBlock command="ros2 run tf2_ros tf2_echo map odom" description="Check if SLAM TF is being published" />
+
+If this times out, SLAM Toolbox is not active or hasn't converged yet.
+
+---
+
+## Try It
+
+### Level 1: Read a Static Transform
+
+Run `ros2 run tf2_ros tf2_echo base_footprint 3d_lidar_link`. Look at the Z translation value. What does 0.938 meters tell you physically about the robot? (Answer: the LiDAR is mounted 93.8 cm above the ground — nearly a meter up on top of the bus body.)
+
+### Level 2: Survey the Full TF Tree
+
+Run `ros2 run tf2_ros tf2_monitor` for 10 seconds and press Ctrl+C. Which transforms update most frequently? Which are static? Compare the update rate of `odom → base_footprint` to `map → odom`. Why does SLAM update less frequently than odometry?
+
+### Level 3: Break It and Observe
+
+Kill `robot_state_publisher` on the Pi (Ctrl+C in the terminal where it is running). Within 5 seconds, check the KISS-ICP terminal on the laptop. You should see "Invalid frame ID" errors for `3d_lidar_link`. Now restart `robot_state_publisher` — does KISS-ICP recover automatically, or do you need to restart it too? (Answer: KISS-ICP caches TF failures and typically needs to be restarted.)
+
+---
+
+**Next module:** [M4: Odometry](/modules/4-odometry) — How KISS-ICP turns LiDAR scans into motion estimates (requires M1 + M3).

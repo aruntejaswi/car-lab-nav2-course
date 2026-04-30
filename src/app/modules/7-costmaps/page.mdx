@@ -1,0 +1,428 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M7: Costmaps
+
+The SLAM map says where walls are. Costmaps say where the robot can actually drive.
+
+---
+
+## Prerequisites
+
+- **M1 (LiDAR)** — you need to understand `/velodyne_points` and `/velodyne_scan`
+- **M6 (SLAM)** — you need a running SLAM session producing the `/map` occupancy grid
+
+---
+
+## What Is a Costmap?
+
+The occupancy grid from SLAM Toolbox (M6) has three values: free (0), occupied (100), and unknown (-1). That is enough to draw a map on screen, but it is not enough for safe navigation. A cell that is technically free but 2 centimeters from a wall is not a place you want a 70 cm wide robot to drive.
+
+A **costmap** is a 2D grid where every cell has a cost from 0 to 255:
+
+| Value | Name | Meaning |
+|-------|------|---------|
+| 0 | Free | No obstacle, safe to drive |
+| 1-252 | Inscribed/inflated | Elevated cost near obstacles — the closer to a wall, the higher the cost |
+| 253 | Inscribed | Inside the robot's radius from an obstacle — guaranteed collision |
+| 254 | Lethal | Obstacle detected here |
+| 255 | Unknown | Not yet observed |
+
+The planner uses these costs to find paths that are not just collision-free, but that keep the robot comfortably away from walls. A path through a cost-0 corridor is preferred over a path that grazes a cost-200 wall, even if the wall-grazing path is shorter.
+
+<Callout type="why">
+Without costmaps, the planner would treat every non-wall cell equally. It would happily route the robot 1 cm from a table leg, leaving zero margin for odometry error or steering overshoot. The cost gradient around obstacles is what makes the robot prefer the center of a hallway over the edges.
+</Callout>
+
+---
+
+## Two Costmaps, Two Jobs
+
+Nav2 maintains two separate costmaps, each optimized for a different task.
+
+### Global costmap
+
+The **global costmap** covers the entire known environment. The path planner (M8) uses it to compute a route from the robot's current position to a distant goal. It needs to see the whole map, but it does not need fine detail.
+
+From `nav2_params.yaml`:
+
+```yaml
+global_costmap:
+  global_costmap:
+    global_frame: map
+    robot_base_frame: base_footprint
+    rolling_window: true
+    width: 20           # 20 meters wide
+    height: 20          # 20 meters tall
+    resolution: 0.2     # 20 cm per cell
+    robot_radius: 0.35  # meters
+    update_frequency: 1.0
+    publish_frequency: 1.0
+    plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+```
+
+Key details:
+
+- **Frame: `map`** — the global costmap is anchored to the SLAM map frame. It does not move with the robot.
+- **Resolution: 0.2 m** — each cell is 20 cm. Coarser than the SLAM map (5 cm) because the global planner does not need centimeter precision. Coarser resolution means fewer cells, which means faster planning over large areas.
+- **`rolling_window: true`** — the costmap window follows the robot, keeping it centered in the 20x20 m grid. Even though the frame is `map`, the window scrolls so the robot always has costmap coverage around it.
+- **Three plugins** run in order: static_layer loads the SLAM map, obstacle_layer adds live sensor data, and inflation_layer inflates costs around obstacles.
+
+### Local costmap
+
+The **local costmap** is a smaller, higher-resolution grid centered on the robot. The controller (M9) uses it to avoid obstacles in the immediate vicinity while following the planned path.
+
+```yaml
+local_costmap:
+  local_costmap:
+    global_frame: odom
+    robot_base_frame: base_footprint
+    rolling_window: true
+    width: 20           # 20 meters wide
+    height: 20          # 20 meters tall
+    resolution: 0.1     # 10 cm per cell
+    robot_radius: 0.35  # meters
+    update_frequency: 10.0
+    publish_frequency: 2.0
+    plugins: ["obstacle_layer", "inflation_layer"]
+```
+
+Key differences from the global costmap:
+
+- **Frame: `odom`** — the local costmap lives in the odometry frame, not the map frame. This makes it smooth and jitter-free for the controller, even when SLAM corrections cause the `map` frame to jump (recall the smooth-vs-accurate split from M6).
+- **Resolution: 0.1 m** — twice as fine as the global costmap. The controller needs more detail to thread through tight spaces.
+- **No static_layer** — the local costmap does not load the SLAM map. It only uses live sensor data. This means it reacts instantly to new obstacles (a person walking into the path) without waiting for SLAM to update its map.
+- **`update_frequency: 10.0`** — updates 10 times per second, compared to 1 Hz for the global costmap. The controller needs fresh obstacle data to react quickly.
+
+<Callout type="why">
+The two-costmap design mirrors the two-frame architecture from M6. The global costmap operates in the <code>map</code> frame for accurate long-range planning. The local costmap operates in the <code>odom</code> frame for smooth short-range control. Same principle, applied to obstacle representation instead of position estimation.
+</Callout>
+
+---
+
+## Costmap Layers
+
+Each costmap is built by stacking **layers**. Each layer adds information to the grid, and the final costmap is the combination of all layers. Think of it like transparent overhead projector sheets stacked on top of each other.
+
+### Static layer (global costmap only)
+
+```yaml
+static_layer:
+  plugin: "nav2_costmap_2d::StaticLayer"
+  enabled: true
+  map_subscribe_transient_local: True
+```
+
+The static layer subscribes to the `/map` topic published by SLAM Toolbox. It copies the occupancy grid directly into the costmap: occupied cells become lethal (254), free cells become free (0), unknown cells become unknown (255).
+
+This layer provides the baseline — the walls, doorframes, and permanent obstacles that SLAM has mapped. It updates whenever SLAM publishes a new map (every 2 seconds, per the `map_update_interval` in M6).
+
+The local costmap does not use a static layer. It relies entirely on live sensor data, so it never has stale wall information from an old map.
+
+### Obstacle layer (both costmaps)
+
+```yaml
+obstacle_layer:
+  plugin: "nav2_costmap_2d::ObstacleLayer"
+  enabled: true
+  observation_sources: pointcloud
+  pointcloud:
+    data_type: PointCloud2
+    topic: /velodyne_points
+    min_obstacle_height: 0.25
+    max_obstacle_height: 1.5     # local; 2.0 for global
+    obstacle_range: 10.0         # local; 20.0 for global
+    clearing: true
+    marking: true
+```
+
+The obstacle layer subscribes directly to the 3D point cloud (`/velodyne_points`) and does two things:
+
+- **Marking:** Points within the height range (0.25 m to 1.5 m above ground for local, 0.25 m to 2.0 m for global) mark cells as lethal. A chair leg, a person's shin, a box on the floor — if the LiDAR sees it, the obstacle layer marks it.
+- **Clearing:** Rays that pass through a cell without hitting anything clear that cell back to free. This is how the costmap removes obstacles that have moved. If someone walks out of the way, the next LiDAR sweep sends rays through the space they occupied, and the obstacle layer clears those cells.
+
+The `min_obstacle_height: 0.25` filter ignores points below 25 cm. This prevents ground reflections and floor texture from appearing as obstacles. The LiDAR sits at 0.938 m height on the school bus, so 0.25 m above ground means only objects taller than about ankle height are marked.
+
+<Callout type="see">
+The obstacle layer on the global costmap has a larger range (20.0 m vs 10.0 m) and taller max height (2.0 m vs 1.5 m). It needs to see farther because it is planning long routes. The local costmap only cares about what is immediately around the robot.
+</Callout>
+
+### Inflation layer (both costmaps)
+
+```yaml
+inflation_layer:
+  plugin: "nav2_costmap_2d::InflationLayer"
+  cost_scaling_factor: 5.0
+  inflation_radius: 0.3
+```
+
+This is the layer that transforms the binary occupied/free grid into a gradient of costs. It takes every lethal cell (254) and propagates decreasing costs outward, up to `inflation_radius` meters away.
+
+The inflation layer is covered in detail in the next section.
+
+---
+
+## Inflation Layer Deep Dive
+
+The inflation layer is where costmaps become genuinely useful. Without it, every cell is either lethal or free — there is no gradient, no preference for staying away from walls. The planner would route the robot 1 cm from an obstacle as happily as 1 meter from it.
+
+### How inflation works
+
+Starting from every lethal cell (254), the inflation layer assigns costs to surrounding cells based on their distance from the obstacle:
+
+1. **Distance 0** — the obstacle cell itself. Cost: 254 (lethal).
+2. **Distance less than `robot_radius` (0.35 m)** — the robot's center cannot be here without the body hitting the obstacle. Cost: 253 (inscribed). The planner treats this as impassable.
+3. **Distance between `robot_radius` and `robot_radius + inflation_radius` (0.35 + 0.3 = 0.65 m)** — elevated cost that drops off with distance. The further from the obstacle, the lower the cost.
+4. **Distance greater than 0.65 m** — cost returns to 0 (free). The robot is far enough away that the inflation layer has no opinion.
+
+### The cost scaling factor
+
+The `cost_scaling_factor` (5.0) controls how quickly cost drops off within the inflation zone. Higher values mean cost drops faster — the "danger zone" near obstacles is narrow and steep. Lower values mean cost drops gradually — the robot prefers to stay further from obstacles even when it could safely pass closer.
+
+The formula is exponential: `cost = 252 * exp(-cost_scaling_factor * (distance - robot_radius))`. At the school bus's settings:
+
+- At the inscribed boundary (0.35 m from obstacle): cost = 253
+- At 0.45 m from obstacle: cost drops to about 150
+- At 0.55 m from obstacle: cost drops to about 50
+- At 0.65 m from obstacle (inflation boundary): cost reaches 0
+
+### Why these values matter
+
+The total clearance the robot demands around obstacles is `robot_radius + inflation_radius = 0.35 + 0.30 = 0.65 m`. This number determines whether the robot can fit through gaps.
+
+Consider a standard interior doorway at 0.8 m wide. The robot needs 0.65 m of clearance on each side of center — but wait, the total clearance is measured from the obstacle to the robot's center, not to its edge. The robot's body extends 0.35 m from center, and the inflation zone adds 0.3 m beyond that. For the robot to pass through, the gap must be at least `2 * robot_radius = 0.70 m` wide (the inscribed zone on both sides must not overlap). The 0.8 m doorway leaves only 0.10 m of margin — tight, but passable.
+
+<Callout type="warning">
+If you increase <code>inflation_radius</code> beyond 0.3 m, the inflated zones from opposite sides of a doorway will overlap, and the gap will be filled with high-cost cells. The planner may still find a path through (the cells are not lethal), but with a large inflation the planner may decide the cost is too high and refuse to plan through the doorway entirely. Always check doorway widths before increasing inflation.
+</Callout>
+
+### Visualizing inflation in RViz
+
+In RViz2, add a `Map` display subscribed to `/global_costmap/costmap`. The display uses a color gradient:
+
+- **Purple/magenta** — lethal cells (the obstacle itself)
+- **Blue** — inscribed zone (guaranteed collision)
+- **Red to yellow** — inflated zone (elevated cost, dropping with distance)
+- **Gray/transparent** — free space (cost 0)
+
+You will see colored halos around every wall and obstacle. Narrow passages like doorways show two halos meeting in the middle. If the halos merge into a solid band, the planner will struggle to find a path through.
+
+---
+
+## Hands-on: Inspecting Costmaps
+
+### Reading costmap metadata
+
+With Nav2 running, inspect the raw costmap data:
+
+<CommandBlock command="ros2 topic echo /global_costmap/costmap_raw --once" description="Print one global costmap message" />
+
+<TerminalOutput title="Laptop -- /global_costmap/costmap_raw (metadata only, data truncated)">
+{`header:
+  stamp:
+    sec: 1777544902
+    nanosec: 118442112
+  frame_id: map
+metadata:
+  map_load_time:
+    sec: 0
+    nanosec: 0
+  resolution: 0.20000000298023224
+  size_x: 100
+  size_y: 100
+  origin:
+    position:
+      x: -10.0
+      y: -10.0
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  layer: ''
+data: [0, 0, 0, 0, 0, 0, 254, 254, 253, 200, 128, 64, 0, 0, ...]`}
+</TerminalOutput>
+
+The math: `size_x: 100` cells at `resolution: 0.2` = 20.0 meters, matching the configured `width: 20`. The `origin` at (-10.0, -10.0) places the costmap centered around the robot's starting position.
+
+The `data` array contains 10,000 values (100 x 100), one cost per cell. You can see the pattern: runs of 0 (free space), then 254 (lethal obstacle), 253 (inscribed), and a decay through 200, 128, 64 back to 0 — that is the inflation gradient radiating outward from a wall.
+
+<CommandBlock command="ros2 topic echo /local_costmap/costmap_raw --once" description="Print one local costmap message" />
+
+<TerminalOutput title="Laptop -- /local_costmap/costmap_raw (metadata only, data truncated)">
+{`header:
+  stamp:
+    sec: 1777544902
+    nanosec: 218112384
+  frame_id: odom
+metadata:
+  map_load_time:
+    sec: 0
+    nanosec: 0
+  resolution: 0.10000000149011612
+  size_x: 200
+  size_y: 200
+  origin:
+    position:
+      x: -10.0
+      y: -10.0
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  layer: ''
+data: [0, 0, 0, 0, 254, 254, 253, 180, 95, 32, 0, 0, 0, ...]`}
+</TerminalOutput>
+
+Notice the local costmap has `size_x: 200` because it covers the same 20 m width at double the resolution (0.1 m vs 0.2 m). That is 40,000 cells total — four times as many as the global costmap for the same area.
+
+### Querying parameters at runtime
+
+You can read costmap parameters from running nodes without restarting anything:
+
+<CommandBlock command="ros2 param get /local_costmap/local_costmap inflation_layer.inflation_radius" description="Check the current inflation radius" />
+
+<TerminalOutput title="Laptop -- inflation_layer.inflation_radius">
+{`Double value is: 0.3`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 param get /global_costmap/global_costmap robot_radius" description="Check the configured robot radius" />
+
+<TerminalOutput title="Laptop -- robot_radius">
+{`Double value is: 0.35`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 param get /local_costmap/local_costmap resolution" description="Check local costmap resolution" />
+
+<TerminalOutput title="Laptop -- local costmap resolution">
+{`Double value is: 0.1`}
+</TerminalOutput>
+
+---
+
+## Failure Gallery
+
+### Inflation too large: robot refuses to plan through doorways
+
+**Symptom:** You send a Nav2 goal on the other side of a doorway. The planner fails with "No valid path found" or the robot takes an absurdly long detour to avoid the doorway.
+
+**Cause:** The inflation radius is too large. With `inflation_radius: 0.8` (for example), each side of a 0.8 m doorway produces an inflation zone that extends 0.8 m from the wall. The two zones overlap completely in the doorway, creating a corridor of high-cost or inscribed cells. The planner decides it cannot pass through safely.
+
+**Fix:** Reduce `inflation_radius`. On the school bus, 0.3 m leaves enough margin without blocking standard doorways. You can also reduce `cost_scaling_factor` to make the cost drop off faster, which softens the inflation halo without changing its radius.
+
+### Stale obstacles: objects removed but still in costmap
+
+**Symptom:** You move a box out of the robot's path, but the costmap still shows a lethal obstacle where the box used to be. The robot refuses to drive through the now-empty space.
+
+**Cause:** The obstacle layer's clearing is not working. This happens when:
+
+1. The LiDAR cannot see through the area where the obstacle was (something else is blocking the line of sight, so no clearing rays pass through)
+2. The obstacle was in the static layer (loaded from the SLAM map), which does not clear dynamically — it only updates when SLAM publishes a new `/map`
+3. The point cloud is not reaching the obstacle layer (topic mismatch or node crash)
+
+**Fix:** For case 1, drive the robot so the LiDAR has a clear line of sight through the area. For case 2, continue mapping with SLAM active so the occupancy grid updates. For case 3, verify the obstacle layer's topic matches the actual point cloud topic:
+
+<CommandBlock command="ros2 param get /local_costmap/local_costmap obstacle_layer.pointcloud.topic" description="Verify which topic the obstacle layer subscribes to" />
+
+### Local costmap shows obstacles but global does not (or vice versa)
+
+**Symptom:** The local costmap correctly shows a new obstacle, but the global costmap ignores it. Or the global costmap shows walls from the SLAM map but the local costmap is empty.
+
+**Cause:** The two costmaps have different plugin configurations. The global costmap has a static layer that the local does not. If the obstacle layer is misconfigured on one but not the other, you get this asymmetry.
+
+**Fix:** Check that both costmaps have an `obstacle_layer` with the correct topic. Remember that the local costmap intentionally lacks a `static_layer` — that is by design, not a bug.
+
+---
+
+## The Layer Stack in Action
+
+When a costmap update fires, the layers execute in the order they are listed in the `plugins` array. For the global costmap, the sequence is:
+
+```
+1. static_layer   →  Loads SLAM map walls into the grid
+2. obstacle_layer  →  Adds/clears live LiDAR obstacles on top
+3. inflation_layer →  Inflates costs around ALL lethal cells from layers 1 and 2
+```
+
+Order matters. The inflation layer must come last because it inflates everything that the previous layers have marked. If you put inflation before obstacle, newly detected obstacles would have no inflation halo — the planner would route the robot right next to them.
+
+For the local costmap:
+
+```
+1. obstacle_layer  →  Live LiDAR obstacles only (no SLAM map)
+2. inflation_layer →  Inflate around those obstacles
+```
+
+The local costmap is purely reactive. It has no memory of the environment beyond what the LiDAR can currently see. This is a feature, not a limitation — it means the local costmap can never have stale obstacles from an old SLAM map.
+
+<Callout type="see">
+In RViz2, you can toggle individual costmap layers on and off by subscribing to <code>/global_costmap/costmap</code> and <code>/local_costmap/costmap</code> as separate Map displays. Compare them side by side: the global costmap shows SLAM walls plus live obstacles; the local costmap shows only what the LiDAR sees right now.
+</Callout>
+
+---
+
+## Connection to Other Modules
+
+The costmaps sit at the center of the Nav2 pipeline. They consume data from the modules you have already built:
+
+```
+/map (M6 SLAM)       → static_layer   → global costmap → planner (M8)
+/velodyne_points (M1) → obstacle_layer → both costmaps  → controller (M9)
+TF tree (M3)          → frame lookups  → both costmaps
+EKF odometry (M5)     → odom frame     → local costmap
+```
+
+And they feed data to the modules ahead:
+
+- **Path planner (M8)** reads the global costmap to find a collision-free route
+- **Path controller (M9)** reads the local costmap to adjust steering in real time
+- **Behavior server (M11)** reads both costmaps to decide when to trigger recovery behaviors like backup
+
+If the costmaps are wrong, everything downstream is wrong. A missing inflation layer means the planner routes too close to walls. A stale obstacle layer means the controller swerves around ghosts. Getting the costmaps right is the foundation for reliable navigation.
+
+---
+
+## Try It
+
+### Level 1: Read the costmap dimensions
+
+With Nav2 running, query the global and local costmap metadata. Verify the resolution and size match what is configured in `nav2_params.yaml`.
+
+<CommandBlock command="ros2 topic echo /global_costmap/costmap_raw --once | head -20" description="Check global costmap metadata" />
+
+Calculate: how many cells does the global costmap have? How many does the local costmap have? Which one uses more memory, and why?
+
+<Callout type="see">
+Global: 100 x 100 = 10,000 cells (20 m at 0.2 m resolution). Local: 200 x 200 = 40,000 cells (20 m at 0.1 m resolution). The local costmap uses 4x more memory because it has half the cell size in each dimension. This is the tradeoff: the controller needs fine detail to avoid obstacles at close range, but that detail costs memory and CPU.
+</Callout>
+
+### Level 2: Change the inflation radius live
+
+Increase the inflation radius and observe the effect in RViz:
+
+<CommandBlock command="ros2 param set /local_costmap/local_costmap inflation_layer.inflation_radius 0.8" description="Triple the inflation radius on the local costmap" />
+
+Watch the costmap in RViz. The colored halos around obstacles should visibly expand. If there is a doorway nearby, check whether the halos from opposite walls now overlap. Then send a Nav2 goal through that doorway — does the planner still find a path?
+
+Reset when done:
+
+<CommandBlock command="ros2 param set /local_costmap/local_costmap inflation_layer.inflation_radius 0.3" description="Restore the original inflation radius" />
+
+### Level 3: Trace an obstacle through the stack
+
+Place an object (a box, a chair) about 2 meters in front of the robot. Then answer these questions by inspecting the system:
+
+1. Is the obstacle visible in `/velodyne_points`? (Check RViz PointCloud2 display)
+2. Does the obstacle appear in the local costmap? (Check `/local_costmap/costmap` in RViz)
+3. Does the obstacle appear in the global costmap? (Check `/global_costmap/costmap` in RViz)
+4. Now remove the object. How long does it take for each costmap to clear? The local costmap should clear within one update cycle (0.1 s). The global costmap may take longer if the static layer has already incorporated it into the SLAM map.
+
+This exercise traces the full data flow: LiDAR point cloud, through the obstacle layer, through inflation, and finally to the planner and controller that use the result.
+
+---
+
+**Next module:** [M8: Path Planning](/modules/8-path-planning) -- How SmacPlannerHybrid uses the global costmap and Hybrid A* to find Ackermann-feasible routes to the goal.

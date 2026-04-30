@@ -1,0 +1,372 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M6: SLAM — Building the Map
+
+The robot needs a map to navigate, but it needs to navigate to build a map. SLAM solves both problems at once.
+
+---
+
+## The SLAM Problem
+
+Imagine you wake up in a dark building with a flashlight. You want to draw a floor plan (a map), but to draw it accurately you need to know where you are standing. And to know where you are standing, you need the floor plan you haven't drawn yet. This is the chicken-and-egg problem at the heart of robotics navigation.
+
+**SLAM** — Simultaneous Localization And Mapping — solves both at once. The robot drives around, taking laser scans and matching them against what it has seen before. Each new scan both extends the map and refines the robot's estimate of where it is within that map. The two problems are not solved sequentially; they are solved together, each improving the other with every new observation.
+
+On the school bus, SLAM Toolbox is the node that performs SLAM. It takes 2D laser scans from `/velodyne_scan` (produced by the pointcloud-to-laserscan converter you set up in M1) and the EKF odometry from M5, and produces two outputs:
+
+1. **`/map`** — an occupancy grid showing walls, obstacles, and free space
+2. **`map -> odom` TF** — a correction factor that compensates for odometry drift
+
+<Callout type="why">
+  Without SLAM, the robot has no map and no way to correct odometry drift. Nav2 cannot plan a path without a map. The controller cannot avoid walls without knowing where walls are. SLAM is the bridge between raw sensor data and intelligent navigation.
+</Callout>
+
+---
+
+## How SLAM Toolbox Works
+
+SLAM Toolbox uses a technique called **pose-graph SLAM**. Here is how it works, step by step, without the math.
+
+### Step 1: Receive a laser scan
+
+Every time the LiDAR completes a rotation, the pointcloud-to-laserscan converter produces a 2D scan on `/velodyne_scan`. SLAM Toolbox subscribes to this topic.
+
+### Step 2: Check if the robot has moved enough
+
+Not every scan is useful. If the robot is sitting still, adding more scans just wastes memory. SLAM Toolbox checks the odometry and only processes a new scan if the robot has moved at least **5 cm** or rotated at least **~3 degrees** (0.05 radians) since the last processed scan:
+
+```yaml
+minimum_travel_distance: 0.05   # meters — must move 5cm
+minimum_travel_heading: 0.05    # radians — must rotate ~3 degrees
+```
+
+### Step 3: Scan matching
+
+SLAM Toolbox takes the new scan and tries to align it with existing scans in the map. This is conceptually similar to the ICP algorithm used by KISS-ICP in M4, but applied to 2D map building instead of 3D odometry. The algorithm slides and rotates the new scan until it best overlaps with what has already been mapped.
+
+The Ceres Solver (a nonlinear optimization library) handles the heavy lifting:
+
+```yaml
+solver_plugin: solver_plugins::CeresSolver
+ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+```
+
+### Step 4: Add to the pose graph
+
+Once matched, the scan and its estimated position become a new **node** in a pose graph. Edges connect this node to nearby nodes, encoding the spatial relationship between them. Over time, the pose graph grows into a web of interconnected scan positions that collectively define the map.
+
+### Step 5: Loop closure
+
+This is where SLAM earns its name. Suppose the robot drives down a hallway, turns left, turns left again, and arrives back at the hallway entrance. Odometry has accumulated drift along the entire path — maybe 10 or 20 cm of error. But SLAM Toolbox recognizes that the current scan matches a scan from earlier in the run. It has detected a **loop closure**.
+
+When a loop closure is detected, the solver re-optimizes the entire pose graph. Every node along the loop shifts slightly to distribute the error correction. The map snaps into a more accurate shape.
+
+```yaml
+do_loop_closing: true
+loop_search_maximum_distance: 4.0   # look for matches within 4 meters
+```
+
+### Processing mode
+
+SLAM Toolbox runs in **online asynchronous** mode on the school bus. "Online" means it processes scans as they arrive in real time (not from a recorded bag file). "Asynchronous" means it does not block — if scan matching takes longer than expected, it skips scans rather than falling behind. This keeps the system responsive on the Raspberry Pi's limited CPU.
+
+```yaml
+mode: mapping
+```
+
+<Callout type="see">
+  In RViz2, add a <code>Map</code> display subscribed to <code>/map</code>. As you drive the robot, you will see walls and obstacles appear in real time. Gray cells are unknown, white cells are free space, and black cells are occupied (walls, furniture, legs of tables).
+</Callout>
+
+---
+
+## Key Parameters Explained
+
+Here is the full SLAM Toolbox configuration from `nav2_params.yaml`, with each parameter tied to its physical consequence.
+
+### Map resolution
+
+```yaml
+resolution: 0.05   # 5 cm per pixel
+```
+
+Each cell in the occupancy grid represents a 5 cm by 5 cm square of floor space. Smaller values give more detail but use more memory and CPU. At 0.05, a 7-meter room is 140 cells wide — detailed enough to see furniture legs, coarse enough to run on a Pi.
+
+### Laser range limits
+
+```yaml
+min_laser_range: 0.5    # ignore anything closer than 50 cm
+max_laser_range: 10.0   # ignore anything farther than 10 m
+```
+
+These match the range limits in the pointcloud-to-laserscan converter from M1. Points closer than 50 cm are usually the robot's own body. Points beyond 10 meters are unreliable indoors (too much noise at long range).
+
+### Scan buffer
+
+```yaml
+scan_buffer_size: 15
+```
+
+SLAM Toolbox keeps the 15 most recent scans in a buffer for matching against incoming scans. A larger buffer improves match quality but increases CPU load.
+
+### Scan matching thresholds
+
+```yaml
+link_match_minimum_response_fine: 0.55
+link_scan_maximum_distance: 1.5
+```
+
+`link_match_minimum_response_fine` controls how confident the scan matcher must be before accepting a match. At 0.55 (on a 0-to-1 scale), it requires moderate confidence — not so strict that it rejects valid matches in featureless corridors, not so loose that it accepts garbage matches.
+
+`link_scan_maximum_distance` limits how far away a stored scan can be (1.5 meters) and still be considered for matching. This prevents the algorithm from wasting time trying to match scans from completely different parts of the map.
+
+### Map publishing
+
+```yaml
+transform_publish_period: 0.05   # publish map->odom TF at 20 Hz
+map_update_interval: 2.0         # rebuild the occupancy grid every 2 seconds
+```
+
+The `map -> odom` TF is published at 20 Hz so that Nav2 always has a fresh transform. But regenerating the full occupancy grid image is expensive, so it only happens every 2 seconds. This is fine — the map doesn't change rapidly, and Nav2's costmaps update on their own cycle.
+
+### Frame configuration
+
+```yaml
+odom_frame: odom
+map_frame: map
+base_frame: base_footprint
+scan_topic: /velodyne_scan
+```
+
+These tell SLAM Toolbox which frames to use from the TF tree (M3) and which topic carries the laser scans. If any of these are wrong — even by a single character — SLAM will fail silently.
+
+---
+
+## The map-to-odom Transform
+
+This is the most important conceptual piece in this module. If you understand why `map -> odom` exists, you understand SLAM.
+
+### The problem with odometry alone
+
+The EKF from M5 publishes `odom -> base_footprint`. It says "the robot has moved 5.0 meters forward from where it started." But odometry drifts. After driving 5 meters, the robot might really be at 4.8 meters. After 50 meters, it might be off by a full meter. The error only grows.
+
+### What SLAM adds
+
+SLAM Toolbox compares the robot's estimated position (from odometry) against the map it is building (from laser scans). When it finds a discrepancy, it publishes a `map -> odom` transform that corrects the error.
+
+Think of `map -> odom` as a **drift correction factor**:
+
+- **`odom -> base_footprint`** says: "The robot thinks it has moved this far"
+- **`map -> odom`** says: "Odometry is off by this much"
+- **`map -> base_footprint`** (the chain) says: "The robot is actually here"
+
+When SLAM just starts, there is no drift to correct, so `map -> odom` is identity:
+
+<TerminalOutput title="tf2_echo map odom (SLAM just started, no drift yet)">
+{`At time 0.0
+- Translation: [0.000, 0.000, 0.000]
+- Rotation: in Quaternion [0.000, 0.000, 0.000, 1.000]
+- Rotation: in RPY (radian) [0.000, 0.000, 0.000]
+- Rotation: in RPY (degree) [0.000, 0.000, 0.000]`}
+</TerminalOutput>
+
+As the robot drives and odometry drifts, this transform will change. When SLAM detects a loop closure, it can jump suddenly — correcting the entire accumulated error at once.
+
+### Why not just publish map-to-base_footprint directly?
+
+This is a deliberate design choice. Odometry is **smooth but drifts**. SLAM corrections are **accurate but can jump**. By keeping them as two separate transforms:
+
+- Local planning (collision avoidance) uses `odom -> base_footprint`, which is smooth — the robot doesn't suddenly teleport in the controller's view
+- Global planning (reaching a distant goal) uses `map -> base_footprint` (the full chain), which is accurate
+
+If SLAM published `map -> base_footprint` directly, every loop closure correction would cause the robot to "jump" in the controller's reference frame, potentially triggering emergency stops or erratic steering.
+
+<Callout type="why">
+  The three-frame chain <code>map -> odom -> base_footprint</code> is not just a Nav2 convention — it is a fundamental architectural pattern in mobile robotics. Smooth local motion and accurate global position require different update rates and different levels of noise. The <code>odom</code> frame is the boundary between them.
+</Callout>
+
+---
+
+## The Occupancy Grid
+
+SLAM Toolbox publishes its map as an **occupancy grid** on the `/map` topic. This is a 2D grid where every cell has one of three values:
+
+| Value | Meaning | RViz color |
+|-------|---------|------------|
+| `0` | Free — the robot can drive here | White |
+| `100` | Occupied — there is a wall or obstacle | Black |
+| `-1` | Unknown — the robot hasn't observed this area yet | Gray |
+
+### Real map from the school bus
+
+Here is the actual map metadata captured from a SLAM session in the lab:
+
+```yaml
+resolution: 0.05           # 5 cm per pixel
+width: 146                 # 146 cells wide
+height: 118                # 118 cells tall
+origin:
+  position:
+    x: -2.32
+    y: -3.30
+    z: 0.0
+```
+
+The math: 146 cells at 0.05 m each = **7.3 meters** wide. 118 cells at 0.05 m each = **5.9 meters** tall. This is roughly the size of the lab where the school bus operates indoors.
+
+The **origin** at (-2.32, -3.30) is the real-world position of the map's bottom-left corner. This is not where the robot started — SLAM places the origin based on the extent of what has been mapped. As the robot explores in different directions, the map grows and the origin shifts to accommodate new cells.
+
+### Saving the map
+
+Once you have driven the robot through the entire area and the map looks complete in RViz, save it for future use:
+
+<CommandBlock command="ros2 run nav2_map_server map_saver_cli -f ~/maps/nav2_map" description="Save the current SLAM map to disk" />
+
+This creates two files:
+
+- **`nav2_map.pgm`** — a grayscale image where each pixel is one cell (white = free, black = occupied, gray = unknown)
+- **`nav2_map.yaml`** — metadata including resolution, origin, and thresholds
+
+The saved map can be loaded later in **localization mode** (M5's AMCL) instead of running SLAM again. This is useful for repeated operation in a known environment — no need to rebuild the map every time.
+
+---
+
+## The 25-Second Delay
+
+When the school bus bringup launches, SLAM Toolbox and Nav2 do not start at the same time. Nav2 is deliberately delayed by 25 seconds.
+
+### Why the delay exists
+
+SLAM Toolbox needs time to:
+
+1. Subscribe to `/velodyne_scan` and discover the topic
+2. Look up the TF chain (`base_footprint -> 3d_lidar_link`) from `robot_state_publisher`
+3. Receive and process the first few laser scans
+4. Publish the initial `map -> odom` transform
+
+Only after step 4 does the `map` frame exist in the TF tree. If Nav2 tries to activate before this happens, it looks for `map`, cannot find it, and its lifecycle activation fails. The costmaps fail. The planner fails. The controller fails. Everything cascades.
+
+The fix is a `TimerAction` in `bringup_launch.py`:
+
+```python
+TimerAction(period=25.0, actions=[...Nav2 launch...])
+```
+
+This gives SLAM a 25-second head start. In practice, SLAM publishes its first `map -> odom` within 5-10 seconds on the school bus hardware. The extra margin accounts for slow startup on cold boot or when the Pi is under load.
+
+<Callout type="warning">
+  If you ever see Nav2 fail to activate with "frame map does not exist" errors and SLAM is running, the 25-second delay may not be long enough. This can happen if you are loading a large pre-existing map or if the Pi is running hot and throttling its CPU. Increase the <code>period</code> value in <code>bringup_launch.py</code> to 35 or 40 seconds.
+</Callout>
+
+### Lifecycle activation sequence
+
+When the delay completes and everything is working, you will see this in the terminal:
+
+<TerminalOutput title="SLAM lifecycle activation (normal)">
+{`[lifecycle_manager_slam] Activating map_saver
+[slam_toolbox] Activating
+[lifecycle_manager_slam] Managed nodes are active`}
+</TerminalOutput>
+
+After this, Nav2's own lifecycle manager activates the costmaps, planner, and controller. The full activation takes about 30-35 seconds from initial launch.
+
+---
+
+## Pitfall: SLAM Session Files
+
+SLAM Toolbox has a feature that can cause serious confusion if you are not aware of it. When running, it writes session state to two files:
+
+- `slam_session.posegraph` — the pose graph (all scan positions and their connections)
+- `slam_session.data` — the raw scan data for each node
+
+On the next launch, SLAM Toolbox checks for these files and **automatically reloads them**. This means you are not starting with a fresh map — you are continuing the previous session.
+
+This sounds helpful, but in practice it causes problems. If the robot has been physically moved between sessions (someone carried it to a different room), the old map and the new observations clash. You see walls overlapping at impossible angles. The map jumps erratically. SLAM cannot converge because the old graph contradicts the new scans.
+
+<Callout type="warning">
+  Before every fresh SLAM session, delete the session files:
+  <code>rm -f slam_session.posegraph slam_session.data</code>.
+  If you forget this step and the map looks wrong, this is almost certainly the reason. Kill SLAM, delete the files, and relaunch.
+</Callout>
+
+---
+
+## Pitfall: DDS Shared Memory
+
+ROS2 uses DDS (Data Distribution Service) for communication between nodes. On the school bus, DDS uses shared memory files in `/dev/shm/` for fast data transfer. These files persist after nodes are killed.
+
+If you launch SLAM with stale DDS shared memory files from a previous session, you can see bizarre symptoms:
+
+- The map jumps or teleports in RViz
+- TF frames appear to be in two places at once
+- SLAM receives ghost data from dead publishers
+
+The fix is to clean up before every bringup:
+
+<CommandBlock command="./scripts/preflight.sh --fix" description="Clean DDS shared memory and verify system state" />
+
+This script removes stale `/dev/shm/fastrtps_*` files along with other pre-flight checks.
+
+<Callout type="warning">
+  Never clean DDS shared memory on the Pi while <code>ractor-sensors.service</code> is running. This destroys the service's DDS context, silently killing the Velodyne and IMU publishers. If you need a clean DDS state on the Pi, restart the service instead: <code>sudo systemctl restart ractor-sensors.service</code>.
+</Callout>
+
+---
+
+## Putting It All Together
+
+Here is the complete data flow from laser scan to navigable map, showing how SLAM fits into the pipeline you have built across modules M1 through M5:
+
+```
+Velodyne LiDAR (M1)
+  -> /velodyne_points (3D point cloud)
+  -> pointcloud_to_laserscan (M1)
+  -> /velodyne_scan (2D laser scan)
+  -> SLAM Toolbox (this module)
+  -> /map (occupancy grid) + map->odom TF (drift correction)
+
+In parallel:
+  KISS-ICP (M4) -> odom->base_footprint TF
+  EKF (M5) -> fused odometry -> feeds SLAM's position estimate
+
+TF chain (M3):
+  map -> odom -> base_footprint -> 3d_lidar_link
+```
+
+SLAM Toolbox sits at the intersection. It consumes laser scans from M1, relies on the TF tree from M3, uses odometry from M4/M5, and produces the map and global frame that Nav2 needs to plan paths.
+
+---
+
+## Try It
+
+### Level 1: Read the map metadata
+
+With SLAM running, check the map dimensions.
+
+<CommandBlock command="ros2 topic echo /map_metadata --once" description="Print the current map metadata" />
+
+Look at the `width`, `height`, and `resolution` fields. Multiply width by resolution and height by resolution. What are the map dimensions in meters? How does this compare to the physical size of the room?
+
+### Level 2: Watch SLAM correct drift
+
+Open two terminals. In the first, start monitoring the `map -> odom` transform:
+
+<CommandBlock command="ros2 run tf2_ros tf2_echo map odom" description="Continuously print the SLAM drift correction" />
+
+In the second terminal (or on the joystick), drive the robot forward and back. Watch the translation and rotation values in the first terminal. They start at zero and gradually change as SLAM detects and corrects odometry drift. The changes should be small (centimeters, fractions of a degree) — if they are large, odometry is drifting faster than expected.
+
+### Level 3: Observe a loop closure
+
+This requires a room large enough to drive a loop (at least 3-4 meters per side).
+
+1. Open RViz2 with the Map display on `/map`
+2. Drive the robot in a rectangle, returning to the starting position
+3. Watch the map carefully as the robot completes the loop
+
+When SLAM recognizes that the robot has returned to a previously visited area, the map may visibly snap or shift as the pose graph is re-optimized. If you are watching `tf2_echo map odom` at the same time, you will see the translation values jump at the moment of loop closure. This is SLAM correcting the accumulated drift from the entire loop in a single optimization step.
+
+---
+
+**Next module:** [M7: Costmaps](/modules/7-costmaps) — Where can the robot actually drive? Costmaps turn the raw occupancy grid into a navigation-ready representation with inflation zones around obstacles.

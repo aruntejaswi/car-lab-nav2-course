@@ -1,0 +1,338 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M2: IMU
+
+Measuring orientation and angular velocity
+
+---
+
+## Learning Objectives
+
+By the end of this module you will understand:
+
+- How accelerometers and gyroscopes work at the MEMS level
+- How to read and interpret real IMU data from the robot
+- Why magnetometer-based yaw is disabled indoors
+- How IMU angular velocity feeds into the EKF for smooth odometry
+
+---
+
+## Physics: What Is Inside an IMU
+
+An **Inertial Measurement Unit** (IMU) combines multiple sensors into one chip. The LSM6DSOX on this robot has two: an accelerometer and a gyroscope. Some IMUs also include a magnetometer, but we do not use one here. Let's look at each.
+
+### Accelerometer — Measuring Linear Acceleration
+
+Inside the chip is a tiny silicon **proof mass** suspended on microscopic springs. When the chip accelerates, the proof mass lags behind due to inertia. Capacitive plates on either side detect how far the mass deflects, and that displacement maps to an acceleration value.
+
+The critical insight: **the accelerometer always measures gravity**. A stationary robot sitting on a flat floor reads approximately 9.81 m/s^2 on its Z axis, because gravity is pulling the proof mass downward relative to the chip. This is not a bug — it is how accelerometers work. If you dropped the robot off a building (please don't), all three axes would read zero during free fall.
+
+On our robot, you will see `linear_acceleration.z` around **10.03 m/s^2** when stationary. The offset from the textbook 9.81 is normal — every MEMS sensor has a small calibration bias.
+
+### Gyroscope — Measuring Angular Velocity
+
+The gyroscope uses the **Coriolis effect**. A vibrating mass inside the chip is kept oscillating at a known frequency. When the chip rotates, the Coriolis force pushes that vibrating mass sideways, perpendicular to both the vibration direction and the rotation axis. Capacitive plates detect this sideways deflection and convert it to an angular velocity in radians per second.
+
+When the robot is stationary, the gyro should read zero on all axes. In practice, you will see small noise values around **0.01 rad/s** — this is the sensor noise floor and is completely normal. Good IMU drivers report this noise in the covariance fields so downstream filters can weight the data appropriately.
+
+### Magnetometer — NOT Used on This Robot
+
+Some IMUs include a **magnetometer** (Hall effect sensor) that measures the ambient magnetic field direction. In theory, this gives you an absolute heading reference to magnetic north, like a digital compass.
+
+In practice, it is nearly useless indoors. Steel building structures, electric motors, battery cables, and the robot's own electronics create magnetic interference that overwhelms the Earth's field. On this robot, enabling magnetic yaw caused SLAM maps to warp and rotate — a problem we will examine in detail later in this module.
+
+<Callout type="why">
+  The accelerometer and gyroscope measure different physical quantities: linear acceleration (m/s^2) and angular velocity (rad/s). Neither one directly tells you position or orientation — that requires integration over time, which is what the EKF does (Module 5). The IMU provides the fast, noisy "between scans" measurements that fill the gaps between the LiDAR's slower but more accurate updates.
+</Callout>
+
+---
+
+## The LSM6DSOX Pipeline
+
+The robot's IMU is an **STMicroelectronics LSM6DSOX**, a 6-DOF (3-axis accelerometer + 3-axis gyroscope) MEMS sensor. Here is how its data gets from the physical chip to the ROS2 topic graph.
+
+### Data Flow
+
+```
+LSM6DSOX chip (serial on Pi)
+  → imu_serial_publisher node
+    → /imu/LSM6DSOX_data  [sensor_msgs/msg/Imu]
+```
+
+The `imu_serial_publisher` node runs on the Pi as part of `ractor-sensors.service`. It reads raw accelerometer and gyroscope values over serial, packages them into the standard `sensor_msgs/msg/Imu` message type, and publishes them.
+
+### Key Parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| **Topic** | `/imu/LSM6DSOX_data` | Raw IMU data (no filtering applied) |
+| **Message type** | `sensor_msgs/msg/Imu` | Standard ROS2 IMU message |
+| **Rate** | 100 Hz | 10x faster than LiDAR's 10 Hz |
+| **QoS** | BEST_EFFORT, VOLATILE | Prioritizes freshness over guaranteed delivery |
+| **Frame** | `imu_link` | Mounted at (0.0, 0.0, 0.699) m from `base_footprint` |
+
+The 100 Hz rate is significant. The Velodyne LiDAR produces one scan every 100 ms. Between those scans, the IMU delivers **ten** measurements of angular velocity. This is exactly why the EKF fuses IMU gyro data — it fills the gaps between LiDAR updates with fast rotation estimates, giving smoother odometry.
+
+<Callout type="why">
+  The QoS is set to BEST_EFFORT and VOLATILE because IMU data is high-frequency and ephemeral. If a single 100 Hz sample is lost, the next one arrives 10 ms later. It is better to drop a stale message than to delay the pipeline waiting for retransmission. This is a common pattern for high-rate sensors in ROS2.
+</Callout>
+
+---
+
+## Hands-On: Reading IMU Data
+
+Let's look at real data captured from the robot while it was stationary.
+
+<CommandBlock command="ros2 topic echo /imu/LSM6DSOX_data --once --qos-reliability best_effort" description="Print one IMU message (note: must specify QoS)" />
+
+<TerminalOutput title="Pi — /imu/LSM6DSOX_data (stationary robot)">
+{`header:
+  stamp:
+    sec: 1777544854
+    nanosec: 802179814
+  frame_id: imu_link
+orientation:
+  x: 0.0
+  y: 0.0
+  z: 0.0
+  w: 1.0
+orientation_covariance:
+- -1.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+angular_velocity:
+  x: 0.009773843921720982
+  y: 0.0012217304902151227
+  z: 0.004886921960860491
+angular_velocity_covariance:
+- 2.2275048650044482e-07
+- 0.0
+- 0.0
+- 0.0
+- 2.2275048650044482e-07
+- 0.0
+- 0.0
+- 0.0
+- 2.2275048650044482e-07
+linear_acceleration:
+  x: 0.10169496387243271
+  y: -0.21774686872959137
+  z: 10.02592658996582
+linear_acceleration_covariance:
+- 0.0002430893073324114
+- 0.0
+- 0.0
+- 0.0
+- 0.0002430893073324114
+- 0.0
+- 0.0
+- 0.0
+- 0.0002430893073324114`}
+</TerminalOutput>
+
+That is a lot of numbers. Let's break it down field by field.
+
+### Orientation: "I don't know"
+
+```yaml
+orientation:
+  x: 0.0
+  y: 0.0
+  z: 0.0
+  w: 1.0
+orientation_covariance:
+- -1.0   # <-- this is the key
+```
+
+The orientation is a quaternion (x, y, z, w). The values (0, 0, 0, 1) represent "identity" — no rotation. But the LSM6DSOX is **not** providing an orientation estimate. The giveaway is `orientation_covariance[0] = -1.0`. Per the ROS2 `sensor_msgs/Imu` convention, a covariance value of **-1** means "this field is not provided by this sensor."
+
+The LSM6DSOX is a 6-DOF sensor: it gives you raw accelerometer and gyroscope readings, but it does not internally compute an orientation estimate. That computation is left to downstream nodes like the EKF. Some fancier IMUs (like the BNO085) have an onboard sensor fusion processor that computes orientation, but the LSM6DSOX does not.
+
+### Angular Velocity: Sensor Noise Floor
+
+```yaml
+angular_velocity:
+  x: 0.009773843921720982    # ~0.01 rad/s
+  y: 0.0012217304902151227   # ~0.001 rad/s
+  z: 0.004886921960860491    # ~0.005 rad/s
+```
+
+The robot is stationary, so all angular velocities should theoretically be zero. The small values you see (~0.001 to ~0.01 rad/s) are **sensor noise**. This is the gyroscope noise floor — random electrical fluctuations in the MEMS structure.
+
+How noisy is this? Convert to degrees: 0.01 rad/s is about 0.57 degrees per second. That is tiny — well within what the EKF can filter out. The covariance value `2.23e-07` (in rad^2/s^2) tells downstream consumers exactly how much to trust these readings.
+
+### Linear Acceleration: Gravity!
+
+```yaml
+linear_acceleration:
+  x: 0.10169496387243271     # ~0.10 m/s²
+  y: -0.21774686872959137    # ~-0.22 m/s²
+  z: 10.02592658996582       # ~10.03 m/s²
+```
+
+This is the most important thing to understand about accelerometer data: **the Z axis reads ~10.03 m/s^2 even though the robot is perfectly still**. That is gravity.
+
+The accelerometer cannot distinguish between gravitational acceleration and actual motion. Einstein figured this out (the equivalence principle). A stationary sensor on Earth's surface and a sensor accelerating upward at 9.81 m/s^2 in deep space produce identical readings.
+
+The X and Y values (0.10 and -0.22) are not zero because the IMU is not perfectly level on the robot. The sensor is slightly tilted, so a small component of gravity leaks into the X and Y axes. These offsets are consistent and predictable — the EKF accounts for them.
+
+<Callout type="see">
+  Summary of stationary IMU data: orientation is not provided (covariance = -1), angular velocities hover near zero with small noise, and linear acceleration shows ~10 m/s^2 on Z (gravity) with small X/Y offsets from imperfect mounting alignment.
+</Callout>
+
+---
+
+## The Magnetometer Problem
+
+This is the story of a real debugging session that led to disabling magnetic yaw on this robot. Understanding it will save you hours of confusion if you ever work with IMU orientation indoors.
+
+### The Setup
+
+The robot originally used a **BNO085** IMU, which has an onboard sensor fusion processor that computes absolute orientation. The BNO085 fuses its accelerometer, gyroscope, and magnetometer to produce a heading referenced to **magnetic north** (an ENU — East-North-Up — reference frame).
+
+Meanwhile, **KISS-ICP** (the LiDAR odometry engine) computes its own heading estimate by matching successive point clouds. KISS-ICP's yaw is **relative** — it starts at zero when the node launches, regardless of which direction the robot is facing.
+
+Both of these yaw estimates were fed into the EKF:
+
+```
+BNO085 yaw:   absolute, referenced to magnetic north
+KISS-ICP yaw: relative, referenced to robot startup heading
+```
+
+### The Problem
+
+Indoors, the magnetic field is distorted by steel structures, reinforcement bars in concrete, electric motors, and power cables. The BNO085's magnetic heading was off by 90 to 180 degrees from the actual heading.
+
+When the EKF tried to blend these two yaw sources, it got confused. The BNO085 said "you're facing north" while KISS-ICP said "you're facing east." The EKF split the difference, producing a heading that was wrong in a slowly drifting, systematic way.
+
+The result in SLAM maps: a **fan artifact**. The map appeared to slowly rotate, creating a fan-shaped smear where walls should have been straight lines. Every few meters of driving introduced a small angular error that accumulated.
+
+### The Fix
+
+The EKF config (`ekf.yaml`) tells the whole story in its comments:
+
+```yaml
+#* DISABLED: BNO085 provides absolute yaw in ENU (magnetic north reference).
+#* KISS-ICP yaw uses robot startup heading as reference. These two reference frames
+#* differ by ~90-180° indoors (magnetic interference), causing EKF to blend
+#* incompatible yaw estimates → systematic rotation → fan/creep map artifact.
+#* KISS-ICP at voxel_size=0.08m provides sufficient yaw for indoor SLAM.
+```
+
+The solution: **only fuse gyroscope angular velocity from the IMU** — never orientation. Angular velocity (how fast you're rotating) does not depend on any reference frame, so there is no conflict between the IMU and KISS-ICP. KISS-ICP provides the absolute heading, and the IMU gyro fills in the smooth rotation detail between scans.
+
+<Callout type="warning">
+  If you see commented-out IMU orientation config in ekf.yaml and think "I should uncomment this for better accuracy," stop. The comments are there for a reason. Enabling magnetic yaw indoors will cause your SLAM maps to distort. The only safe orientation source for indoor navigation is scan-matching (KISS-ICP), not the magnetometer.
+</Callout>
+
+---
+
+## How the IMU Feeds Into the EKF
+
+The EKF (Extended Kalman Filter) is covered in depth in Module 5. Here is a preview of how IMU data specifically fits into the picture.
+
+### What the Local EKF Fuses
+
+The local EKF (`ekf_filter_node_odom`) blends two sensors:
+
+1. **KISS-ICP** (`/kiss/odometry`): position (x, y) and yaw. Updated at ~10 Hz (LiDAR rate). Accurate but relatively slow.
+2. **IMU** (`/imu/BNO085_filtered`): angular velocity (wx, wy, wz) only. Updated at 100 Hz. Fast but noisy.
+
+<Callout type="see">
+  You might notice the EKF config references <code>/imu/BNO085_filtered</code> even though the active hardware is the LSM6DSOX. The BNO085 topic name is a legacy artifact in the config — the important thing is the <code>imu0_config</code> matrix, which controls what data gets fused regardless of which IMU is publishing.
+</Callout>
+
+### The Config Matrix
+
+The `imu0_config` parameter is a 15-element boolean array that tells the EKF exactly which fields from the IMU message to use:
+
+```yaml
+imu0_config: [false, false, false,    # position (x, y, z) — NO
+              false, false, false,    # orientation (roll, pitch, yaw) — NO
+              false, false, false,    # linear velocity (vx, vy, vz) — NO
+              true,  true,  true,    # angular velocity (wx, wy, wz) — YES
+              false, false, false]   # linear acceleration (ax, ay, az) — NO
+```
+
+Out of 15 possible data channels, only three are enabled: angular velocity around all three axes. This is a deliberate, hard-won configuration choice. The EKF ignores the IMU's position (it has none), orientation (magnetometer conflict), linear velocity (not provided), and linear acceleration (gravity contamination adds complexity without enough benefit).
+
+### Why This Combination Works
+
+Between KISS-ICP scans (every 100 ms), the robot might turn. Without the IMU, the EKF would only update its heading estimate at 10 Hz, meaning a fast turn could be missed or appear as a sudden jump.
+
+With the IMU gyro at 100 Hz, the EKF can smoothly interpolate the rotation between scans. The result is continuous, smooth odometry even during turns — which is exactly what the downstream SLAM and Nav2 nodes need.
+
+```
+Time:    0ms    10ms   20ms   ...   90ms   100ms
+KISS:    [scan]                            [scan]
+IMU:     [gyro] [gyro] [gyro] ... [gyro]  [gyro]
+EKF:     [fuse] [fuse] [fuse] ... [fuse]  [fuse]
+```
+
+One more detail: `imu0_remove_gravitational_acceleration: false`. This might look wrong — shouldn't we remove gravity? No, because we are only fusing angular velocity (gyroscope rates), and gravity does not affect the gyroscope. This flag only matters if you are fusing linear acceleration, which we are not.
+
+---
+
+## QoS Mismatch: A Common Gotcha
+
+<Callout type="warning">
+  The IMU publishes with **BEST_EFFORT** QoS reliability. The default for <code>ros2 topic echo</code> is **RELIABLE**. If you run <code>ros2 topic echo /imu/LSM6DSOX_data</code> without specifying QoS, you may get no output at all — it will just hang. Always add <code>--qos-reliability best_effort</code> when echoing sensor topics.
+</Callout>
+
+This is not a bug — it is a ROS2 QoS compatibility rule. A RELIABLE subscriber cannot connect to a BEST_EFFORT publisher because the subscriber expects delivery guarantees that the publisher does not provide. The reverse works fine: a BEST_EFFORT subscriber can connect to a RELIABLE publisher.
+
+You can check any topic's QoS settings with:
+
+<CommandBlock command="ros2 topic info /imu/LSM6DSOX_data --verbose" description="Show full topic info including QoS" />
+
+Look for the `Reliability` field under the publisher's QoS profile. If it says `BEST_EFFORT`, you need to match it.
+
+---
+
+## Try It
+
+### Level 1: Read Stationary IMU Data
+
+Echo the IMU topic while the robot is stationary.
+
+<CommandBlock command="ros2 topic echo /imu/LSM6DSOX_data --once --qos-reliability best_effort" description="Capture one IMU message" />
+
+Questions to answer:
+- What is `linear_acceleration.z`? Why is it not zero?
+- What are the angular velocity values? Are they exactly zero?
+- What does `orientation_covariance[0] = -1.0` mean?
+
+### Level 2: Observe Angular Velocity During a Turn
+
+If you can safely rotate the robot (or pick it up and turn it by hand):
+
+<CommandBlock command="ros2 topic echo /imu/LSM6DSOX_data --qos-reliability best_effort --field angular_velocity" description="Stream only angular_velocity while rotating" />
+
+Watch `angular_velocity.z` as you turn the robot around its vertical axis. During a slow turn (~30 degrees/second), you should see values around **0.5 rad/s**. During a faster turn, it will be larger. Compare this to the ~0.01 rad/s noise floor you saw while stationary.
+
+### Level 3: Investigate the EKF Config
+
+Open the EKF configuration file:
+
+<CommandBlock command="cat ~/ros2_ws/src/nav2_schoolbus/config/ekf.yaml" description="View the EKF sensor fusion config" />
+
+Find the commented-out BNO085 orientation block (look for the `DISABLED` comment). Read the explanation of why it was disabled.
+
+Now find the active `imu0_config` line. Confirm that only angular velocity (positions 9, 10, 11 in the 15-element array) is set to `true`.
+
+**Thought experiment:** What would happen if you uncommented the full BNO085 orientation config? The EKF would try to fuse magnetic-north-referenced yaw from the BNO085 with startup-heading-referenced yaw from KISS-ICP. These two reference frames differ by an unknown angle indoors. The EKF would try to reconcile them, producing a slowly drifting heading error that distorts the SLAM map into a fan shape.
+
+---
+
+## What's Next
+
+- **[M3: TF (Coordinate Frames)](/modules/3-tf)** — How the `imu_link` frame relates to `base_footprint`, `odom`, and `map`. The TF tree is the glue that makes multi-sensor fusion possible.
+- **[M1: LiDAR](/modules/1-lidar)** — If you haven't done it yet, see how the Velodyne produces the point clouds that drive KISS-ICP odometry — the other half of the EKF's input.

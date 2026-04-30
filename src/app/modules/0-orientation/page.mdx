@@ -1,0 +1,406 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M0: Orientation
+
+The robot, the network, and ROS2 basics.
+
+---
+
+## Meet the Robot
+
+This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D LiDAR, IMU, and the full Nav2 stack running on ROS2 Jazzy. Everything in this course comes from real data captured on this hardware.
+
+<div className="my-8 grid grid-cols-1 md:grid-cols-2 gap-4">
+  <figure className="m-0">
+    <img src="/images/robot-front-side.jpg" alt="School bus robot — front/side view" className="rounded-lg border border-zinc-200 dark:border-zinc-700" />
+    <figcaption className="text-sm text-zinc-500 mt-2">Front/side view. The orange traffic cone is for scale — the robot is about 0.9m tall.</figcaption>
+  </figure>
+  <figure className="m-0">
+    <img src="/images/robot-top-down.jpg" alt="School bus robot — top-down view showing all components" className="rounded-lg border border-zinc-200 dark:border-zinc-700" />
+    <figcaption className="text-sm text-zinc-500 mt-2">Top-down view. The Velodyne LiDAR (silver puck on purple mount) sits at the front-left. All four independently-steerable wheels are visible.</figcaption>
+  </figure>
+</div>
+
+### Hardware Components
+
+<div className="my-8 space-y-6">
+
+<div className="flex flex-col sm:flex-row gap-4 items-start">
+  <img src="/images/velodyne-closeup.jpg" alt="Velodyne VLP-16 LiDAR close-up" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full sm:w-64 shrink-0" />
+  <div>
+    <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">Velodyne VLP-16 LiDAR</h4>
+    <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
+      The silver spinning puck on the purple 3D-printed mount. Fires 16 laser beams in a vertical fan while rotating 360 degrees, producing ~29,000 distance measurements per revolution at 10 Hz. This is the robot's primary sensor — it drives odometry, SLAM, costmaps, and collision avoidance. Mounted at (0.178, 0.0, 0.938) meters relative to the robot base, pointed forward.
+    </p>
+    <p className="text-xs text-zinc-500 mt-1 mb-0">Network: 192.168.0.201 · Topic: <code>/velodyne_points</code> · Frame: <code>3d_lidar_link</code></p>
+  </div>
+</div>
+
+<div className="flex flex-col sm:flex-row gap-4 items-start">
+  <img src="/images/pi-board-closeup.jpg" alt="Raspberry Pi 4 with relay HAT" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full sm:w-64 shrink-0" />
+  <div>
+    <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">Raspberry Pi 4 (ARM64)</h4>
+    <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
+      The onboard computer. Runs Ubuntu 24.04 with ROS2 Jazzy. Handles sensor drivers (Velodyne, IMU), motor control via MQTT, the RC receiver, and robot state publishing. It does NOT run SLAM or Nav2 — those need more compute and run on the laptop. The green relay board on top controls power to ESCs and motors.
+    </p>
+    <p className="text-xs text-zinc-500 mt-1 mb-0">IP: 192.168.0.3 · Username: pi</p>
+  </div>
+</div>
+
+<div className="flex flex-col sm:flex-row gap-4 items-start">
+  <img src="/images/wheel-steering-assembly.jpg" alt="Double Ackermann wheel and steering assembly" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full sm:w-64 shrink-0" />
+  <div>
+    <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">Double Ackermann Steering</h4>
+    <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
+      All four wheels steer independently — this is "double Ackermann" geometry. Each wheel has its own steering servo and drive motor controlled by an ESC. The rear wheels steer opposite to the fronts, giving a tighter turning radius. Wheelbase: 0.711m, track width: 0.558m, minimum turning radius: 0.75m.
+    </p>
+    <p className="text-xs text-zinc-500 mt-1 mb-0">Topics: <code>/control/frontleft/control</code>, <code>/control/frontright/control</code>, etc.</p>
+  </div>
+</div>
+
+<div className="flex flex-col sm:flex-row gap-4 items-start">
+  <img src="/images/ibus-receiver.jpg" alt="TGY-IA6B iBus receiver" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full sm:w-64 shrink-0" />
+  <div>
+    <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">RC Receiver (TGY-IA6B)</h4>
+    <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
+      A 2.4GHz iBus receiver connected to the Pi via serial (<code>/dev/ttyAMA0</code>). Receives 8 channels from the handheld transmitter at 50 Hz. This is the safety system — the physical joystick can override Nav2 at any time, and the E-stop switch halts all motion instantly.
+    </p>
+    <p className="text-xs text-zinc-500 mt-1 mb-0">Topics: <code>/control/ch1</code> through <code>/control/ch8</code></p>
+  </div>
+</div>
+
+</div>
+
+### The RC Transmitter
+
+<div className="my-6 flex flex-col sm:flex-row gap-4 items-start">
+  <img src="/images/rc-transmitter.jpg" alt="Turnigy TGY-i6S transmitter with labeled switches" className="rounded-lg border border-zinc-200 dark:border-zinc-700 w-full sm:w-80 shrink-0" />
+  <div>
+    <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-0 mb-3">The Turnigy TGY-i6S transmitter has four toggle switches across the top, each mapped to a function. The labels on the transmitter match these mappings:</p>
+
+| Switch | Channel | Position | Function |
+|--------|---------|----------|----------|
+| SW_A (left) | CH5 | Forward / Reverse | Drive direction |
+| SW_B (center-left) | CH8 | Teleop / Off / Auto | Control mode |
+| SW_C (center-right) | CH7 | Ackermann / Heading / Rotate | Drive mode |
+| SW_D (right) | CH6 | On / E-Stop | Emergency stop |
+
+<Callout type="warning">
+  Never publish fake RC channel values from the command line. Auto/teleop switching MUST happen via the physical joystick (Switch B). Publishing synthetic channel values bypasses the safety interlock and can cause uncontrolled motor behavior.
+</Callout>
+  </div>
+</div>
+
+---
+
+## Two-Machine Architecture
+
+The robot uses two computers because SLAM and Nav2 are too computationally expensive for the Raspberry Pi's ARM64 CPU.
+
+```
+┌─────────────────────────────┐     Ethernet      ┌─────────────────────────────┐
+│     Raspberry Pi 4          │  192.168.0.x/24    │     Robot Laptop            │
+│     192.168.0.3             │◄──────────────────►│     192.168.0.22            │
+│                             │    ROS_DOMAIN_ID   │                             │
+│  Velodyne driver            │        = 99        │  pointcloud_to_laserscan    │
+│  IMU driver (LSM6DSOX)      │                    │  KISS-ICP (odometry)        │
+│  robot_state_publisher      │                    │  EKF (sensor fusion)        │
+│  ibus_reader (RC input)     │                    │  SLAM Toolbox               │
+│  control_tower (motors)     │                    │  Nav2 (full stack)          │
+│  MQTT wheel bridge          │                    │  RViz2 (visualization)      │
+└─────────────────────────────┘                    └─────────────────────────────┘
+         │                                                     │
+    ┌────┴────┐                                          ┌─────┴─────┐
+    │Velodyne │                                          │   You     │
+    │ LiDAR   │                                          │  (SSH)    │
+    │.0.201   │                                          └───────────┘
+    └─────────┘
+```
+
+<Callout type="why">
+  The Pi publishes raw sensor data (LiDAR point clouds at 10 Hz, IMU at 100 Hz). ROS2's DDS middleware automatically discovers and transports these topics across the network. The laptop subscribes to them, runs all the heavy processing, and publishes velocity commands back. The Pi's control_tower node receives those commands and drives the motors. Neither machine knows or cares where the data comes from — that's the power of ROS2's distributed architecture.
+</Callout>
+
+### Network Details
+
+- **All machines** share `ROS_DOMAIN_ID=99` — this isolates the robot's ROS2 traffic from other robots or development machines on the same network
+- **Velodyne LiDAR** has its own IP (192.168.0.201) and streams raw UDP packets to the Pi's driver node
+- **DDS (Fast-RTPS)** handles topic discovery and transport between Pi and laptop automatically
+- **Chrony NTP** keeps clocks synchronized — the laptop serves time to the Pi
+
+---
+
+## ROS2 Crash Course
+
+If you're new to ROS2, here's the minimum you need to know to follow this course. ROS2 organizes robot software into **nodes** that communicate over **topics** by publishing and subscribing to **messages**.
+
+### Nodes
+
+A node is a process that does one thing. The Velodyne driver is a node. KISS-ICP is a node. The motor controller is a node. Each runs independently.
+
+<CommandBlock command="ros2 node list" description="List all running nodes" />
+
+<TerminalOutput title="Pi — ros2 node list">
+{`/control/auto_light_switch
+/control/control_tower_node
+/control/ibus_reader
+/control/mqtt_wheel_bridge
+/imu_serial_publisher
+/joint_state_publisher
+/robot_state_publisher
+/rosboard_node
+/velodyne_driver_node
+/velodyne_transform_node`}
+</TerminalOutput>
+
+<Callout type="see">
+  Node names use slashes for namespacing. Everything under <code>/control/</code> is part of the motor control system. <code>velodyne_driver_node</code> reads raw UDP packets; <code>velodyne_transform_node</code> converts them to PointCloud2 messages.
+</Callout>
+
+### Topics
+
+Topics are named channels that carry messages. A node publishes data to a topic; any other node can subscribe to receive it.
+
+<CommandBlock command="ros2 topic list -t" description="List all topics with their message types" />
+
+<TerminalOutput title="Pi — ros2 topic list -t (excerpt)">
+{`/control/ch1 [std_msgs/msg/Int32]
+/control/ch2 [std_msgs/msg/Int32]
+/control/cmd_vel [geometry_msgs/msg/Twist]
+/control/control_state [std_msgs/msg/String]
+/control/drive_mode [std_msgs/msg/String]
+/control/frontleft/control [geometry_msgs/msg/Point]
+/control/frontright/control [geometry_msgs/msg/Point]
+/diagnostics [diagnostic_msgs/msg/DiagnosticArray]
+/imu/LSM6DSOX_data [sensor_msgs/msg/Imu]
+/joint_states [sensor_msgs/msg/JointState]
+/tf [tf2_msgs/msg/TFMessage]
+/tf_static [tf2_msgs/msg/TFMessage]
+/velodyne_points [sensor_msgs/msg/PointCloud2]`}
+</TerminalOutput>
+
+With the full Nav2 stack running on the laptop, the topic count jumps from ~30 to 80+ as Nav2 adds costmaps, planners, controllers, and more.
+
+### Peeking at Data
+
+Use `ros2 topic echo` to see the actual data flowing through a topic. The `--once` flag prints a single message and exits.
+
+<CommandBlock command="ros2 topic echo /velodyne_points --once" description="Print one PointCloud2 message" />
+
+<TerminalOutput title="Laptop — /velodyne_points (one message)">
+{`header:
+  stamp:
+    sec: 1777544844
+    nanosec: 322304256
+  frame_id: 3d_lidar_link
+height: 1822
+width: 16
+fields:
+- name: x
+  offset: 0
+  datatype: 7
+  count: 1
+- name: y
+  offset: 4
+  datatype: 7
+  count: 1
+- name: z
+  offset: 8
+  datatype: 7
+  count: 1
+- name: intensity
+  offset: 12
+  datatype: 7
+  count: 1
+- name: ring
+  offset: 16
+  datatype: 4
+  count: 1
+...`}
+</TerminalOutput>
+
+<Callout type="see">
+  Every ROS2 message has a <code>header</code> with a timestamp and a <code>frame_id</code>. The frame_id (<code>3d_lidar_link</code>) tells you which coordinate frame the data is expressed in — this connects to the TF system covered in M3. The <code>fields</code> describe the point cloud format: each point has x, y, z position, intensity (reflectivity), and ring (which of the 16 laser beams generated it).
+</Callout>
+
+### Checking Data Rates
+
+Use `ros2 topic hz` to verify a sensor is publishing at the expected rate.
+
+<CommandBlock command="ros2 topic hz /velodyne_points" description="Check LiDAR publish rate" />
+
+<TerminalOutput title="Laptop — topic rates">
+{`/velodyne_points:    9.913 Hz    (expected: 10 Hz)
+/imu/LSM6DSOX_data: 105.754 Hz   (expected: 100 Hz)
+/kiss/odometry:      9.544 Hz    (matches LiDAR input rate)
+/odometry/local:     ~9.4 Hz     (matches KISS-ICP input rate)`}
+</TerminalOutput>
+
+<Callout type="why">
+  Rate checking is the fastest way to diagnose problems. If <code>/velodyne_points</code> reads 0 Hz, the LiDAR isn't publishing — maybe the driver service isn't running, or the network cable is unplugged. If <code>/kiss/odometry</code> is 0 Hz but <code>/velodyne_points</code> is fine, KISS-ICP can't find a TF frame. Rate checks narrow down failures to the exact point in the pipeline.
+</Callout>
+
+---
+
+## The Full Data Flow
+
+Here's how everything connects — from raw sensor data to wheel motion:
+
+```
+Pi                                    Laptop
+──────                                ──────
+Velodyne LiDAR ─► /velodyne_points ─────────► pointcloud_to_laserscan ─► /velodyne_scan
+                                              │
+IMU (LSM6DSOX) ─► /imu/LSM6DSOX_data ────────┤
+                                              │
+                                        KISS-ICP ─► /kiss/odometry
+                                              │                │
+                                              │           TF: odom → base_footprint
+                                              │
+                                        EKF ─► /odometry/local
+                                              │
+                                        SLAM Toolbox ─► /map
+                                              │           │
+                                              │      TF: map → odom
+                                              │
+                                        Nav2 Stack
+                                         ├─ Costmaps (global + local)
+                                         ├─ SmacPlannerHybrid ─► /plan
+                                         └─ RPP Controller ─► /cmd_vel
+                                                                  │
+                                         velocity_smoother ─► /cmd_vel_smoothed
+                                                                  │
+                                         collision_monitor ─► /control/cmd_vel
+                                                                  │
+◄─────────────────────────────────────────────────────────────────┘
+control_tower ─► MQTT ─► 4 wheel ESCs
+```
+
+Each box in this diagram is a module in this course. By M12, you'll understand every arrow.
+
+---
+
+## Startup Sequence
+
+The order matters. Each component depends on what comes before it.
+
+### Step 1: Start Pi Services
+
+The Velodyne driver, IMU driver, and motor control run as systemd services on the Pi. After a power cycle, they need to be started manually:
+
+<CommandBlock command="ssh pi@192.168.0.3 'sudo systemctl start ractor-sensors.service ractor-controls.service'" description="Start sensor and motor services on Pi" />
+
+### Step 2: Launch robot_state_publisher on Pi
+
+This publishes the URDF (robot model) as TF transforms. Without it, no other node can locate the LiDAR or IMU in space.
+
+<CommandBlock command="ros2 launch schoolbus_urdf schoolbus.launch.py" description="Run on Pi — publishes TF tree from URDF" />
+
+<Callout type="warning">
+  <code>robot_state_publisher</code> is NOT part of <code>ractor-sensors.service</code>. It must be launched separately. Forgetting this step is the #1 cause of bringup failures — see the failure gallery below.
+</Callout>
+
+### Step 3: Launch SLAM + Nav2 on Laptop
+
+<CommandBlock command="ros2 launch nav2_schoolbus bringup_launch.py slam:=True use_localization:=True" description="Run on Laptop — launches the full navigation stack" />
+
+This single launch file starts:
+- `pointcloud_to_laserscan` — converts 3D point cloud to 2D laser scan
+- `KISS-ICP` — LiDAR odometry (scan matching)
+- `EKF` — sensor fusion (KISS-ICP + IMU)
+- `SLAM Toolbox` — map building (activates immediately)
+- `Nav2` — costmaps, planner, controller, behavior tree (activates after 25-second delay)
+
+### Step 4: Wait ~35 seconds
+
+SLAM Toolbox needs time to initialize and start publishing the `map` frame. Nav2 is deliberately delayed 25 seconds to give SLAM time to be ready. You'll see lifecycle activation messages scrolling in the terminal.
+
+<TerminalOutput title="Laptop — Nav2 activation sequence">
+{`[lifecycle_manager_slam] Activating map_saver
+[slam_toolbox] Activating
+[lifecycle_manager_slam] Managed nodes are active
+
+--- 25 seconds later ---
+
+[lifecycle_manager_navigation] Activating controller_server
+[controller_server] Activating controller: FollowPath of type
+  regulated_pure_pursuit_controller::RegulatedPurePursuitController
+[planner_server] Activating plugin GridBased of type SmacPlannerHybrid
+[global_costmap] StaticLayer: Resizing static layer to 146 X 118 at 0.05 m/pix
+[behavior_server] Activating backup, drive_on_heading, wait
+[lifecycle_manager_navigation] Managed nodes are active`}
+</TerminalOutput>
+
+### Step 5: Open RViz2 and Send Goals
+
+Launch RViz2 on the laptop, set the Fixed Frame to `map`, and add displays for the point cloud, map, costmaps, and path. Use the "Nav2 Goal" tool to click a destination on the map.
+
+Before sending goals, flip Switch B on the RC transmitter to **Auto** (CH8 = 2000).
+
+---
+
+## Failure Gallery
+
+Real failures from real bringup sessions. Understanding what goes wrong is as important as understanding what goes right.
+
+### Failure: robot_state_publisher not running
+
+**Symptom:** Nav2 lifecycle manager prints "Failed to bring up all requested nodes" about 30 seconds after launch.
+
+<TerminalOutput title="Error — KISS-ICP can't find LiDAR frame">
+{`[kiss_icp_node] [WARN] Failed to find tf. Reason=Invalid frame ID "3d_lidar_link"
+  passed to canTransform argument source_frame - frame does not exist`}
+</TerminalOutput>
+
+<TerminalOutput title="Error — Nav2 can't find map frame">
+{`[component_container_isolated] [INFO] Timed out waiting for transform from
+  base_footprint to map to become available, tf error: Invalid frame ID "map"
+  passed to canTransform argument target_frame - frame does not exist
+
+[component_container_isolated] [ERROR] Failed to activate global_costmap
+[component_container_isolated] [ERROR] Failed to bring up all requested nodes. Aborting bringup.`}
+</TerminalOutput>
+
+**Root cause chain:**
+1. `robot_state_publisher` wasn't running → no `/tf_static` with sensor frames
+2. KISS-ICP can't find `3d_lidar_link` → no odometry → no `odom→base_footprint` TF
+3. SLAM Toolbox can't compute laser pose → no `map→odom` TF
+4. Nav2's 25-second timer fires, but `map` frame doesn't exist → activation fails
+
+**Fix:** Always start `robot_state_publisher` on the Pi BEFORE launching `bringup_launch.py` on the laptop.
+
+### Failure: Stale DDS shared memory
+
+**Symptom:** Map jumps around erratically in RViz2, or topics appear in `ros2 topic list` but carry no data.
+
+**Root cause:** Leftover `/dev/shm/fastrtps_*` files from a previous session confuse DDS topic matching.
+
+**Fix:** Run `preflight.sh --fix` before every bringup. It cleans stale DDS shared memory files on the laptop.
+
+<Callout type="warning">
+  Never clean DDS shared memory on the Pi while <code>ractor-sensors.service</code> is running. It will silently kill the service's DDS context, and topics will stop publishing without any error message. Restart the service instead.
+</Callout>
+
+---
+
+## Try It
+
+### Level 1: Observe
+1. SSH into the Pi (`ssh pi@192.168.0.3`) and run `ros2 topic list`. Count the topics.
+2. Run `ros2 topic hz /velodyne_points`. Is the LiDAR publishing at ~10 Hz?
+3. Run `ros2 topic echo /imu/LSM6DSOX_data --once`. What is the `linear_acceleration.z` value? Why?
+
+### Level 2: Explore
+1. With the full stack running, run `ros2 topic list` from the laptop. How many more topics are there compared to the Pi alone?
+2. Run `ros2 topic echo /control/control_state` while flipping Switch B between Teleop and Auto. What values do you see?
+3. Run `ros2 topic hz /odometry/local`. What determines this rate?
+
+### Level 3: Diagnose
+1. Kill `robot_state_publisher` on the Pi (`Ctrl+C`). What happens to `ros2 topic hz /kiss/odometry` on the laptop? Why?
+2. With the full stack running, run `ros2 run tf2_ros tf2_echo map base_footprint`. What does this transform represent physically?
+
+---
+
+**Next module:** [M1: LiDAR](/modules/1-lidar) — How the Velodyne VLP-16 sees the world in 3D point clouds.

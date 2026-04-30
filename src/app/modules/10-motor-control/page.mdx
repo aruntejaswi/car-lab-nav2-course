@@ -1,0 +1,386 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M10: Motor Control
+
+From cmd_vel to wheel motion.
+
+---
+
+## Learning Objectives
+
+By the end of this module you will be able to:
+
+- Explain how double Ackermann steering differs from standard Ackermann
+- Trace a `/cmd_vel` message through the control tower to individual wheel commands
+- Identify the three drive modes and when each is used
+- Diagnose common motor control failures using RC channel topics
+
+**Prerequisite:** [M9: Path Following](/modules/9-path-following)
+
+---
+
+## Double Ackermann Steering
+
+Standard Ackermann steering (like a car) steers only the front wheels. The rear wheels are fixed. This robot steers **all four wheels independently** — a geometry called double Ackermann. The rear wheels steer in the **opposite direction** from the fronts, which dramatically tightens the turning radius.
+
+```
+Standard Ackermann:              Double Ackermann:
+
+    ╱  ╲   ← front steers           ╱  ╲   ← front steers
+    │  │                             │  │
+    │  │                             │  │
+    │  │   ← rear fixed             ╲  ╱   ← rear steers OPPOSITE
+```
+
+### Why it matters
+
+The robot's wheelbase is 0.711 m and track width is 0.558 m. With standard Ackermann, the minimum turning radius would be limited by the wheelbase. With double Ackermann, the effective pivot point moves to the center of the robot instead of the rear axle, cutting the minimum turning radius roughly in half. This is critical for indoor navigation where the robot needs to maneuver through doorways and around furniture.
+
+| Parameter | Value |
+|-----------|-------|
+| Wheelbase (L) | 0.711 m |
+| Track width (W) | 0.558 m |
+| Max steering angle | 45 degrees |
+| Max wheel angle | 95 degrees |
+| Max velocity | 2.0 m/s |
+
+---
+
+## The DoubleAckermannSteering Class
+
+The `DoubleAckermannSteering` class in `double_ackermann.py` converts a desired velocity and turning radius into four individual wheel angles and velocities. This is the core kinematics engine.
+
+### Straight-line case
+
+When the turning radius is infinite (no angular velocity), all four wheel angles are set to zero and all wheels receive the same velocity. The robot drives straight.
+
+### Turning case
+
+When the robot needs to turn, the class computes geometry for each wheel based on its position relative to the turning center:
+
+```
+                    Turning center
+                         │
+                         │  R (turning radius)
+                         │
+    ┌────────────────────┼────────────────────┐
+    │                    │                    │
+    FL ·─────────────────·─────────────────· FR
+    │   R + W/2          │         R - W/2   │
+    │                    │                    │
+    │         L/2        │                    │
+    │                    · ← robot center     │
+    │         L/2        │                    │
+    │                    │                    │
+    RL ·─────────────────·─────────────────· RR
+    │                    │                    │
+    └────────────────────┴────────────────────┘
+```
+
+**Steering angles** use `atan2` to point each wheel toward the turning center:
+
+- Front left angle: `atan2(L/2, R + W/2)`
+- Front right angle: `atan2(L/2, R - W/2)`
+- Rear left angle: **negated** front left (steers opposite)
+- Rear right angle: **negated** front right (steers opposite)
+
+**Per-wheel velocities** scale based on distance from the turning center. The inner wheel (closer to the turn) moves slower than the outer wheel:
+
+- Inner wheel velocity: `omega * (R - W/2)`
+- Outer wheel velocity: `omega * (R + W/2)`
+
+where `omega = velocity / R` is the angular velocity of the turn.
+
+<Callout type="why">
+Without per-wheel velocity scaling, the inner wheel would be forced to spin at the same speed as the outer wheel despite traveling a shorter arc. The tire would scrub sideways, wasting energy and wearing unevenly. Differential velocity keeps all four wheels rolling cleanly along their individual arcs.
+</Callout>
+
+---
+
+## Three Drive Modes
+
+The robot supports three drive modes, selected by CH7 (Switch C) on the RC transmitter:
+
+### Ackermann (CH7 = 1000)
+
+Normal forward/reverse driving with coordinated four-wheel steering. This is the mode Nav2 uses. The `cmd_vel` message's `linear.x` sets velocity and `angular.z` sets the steering angle, which gets converted to a turning radius via `R = L / tan(angle)`.
+
+### Fixed Heading (CH7 = 1500)
+
+All four wheels point in the same direction. The robot translates sideways or at an angle without changing its heading. This is a manual-only mode for positioning the robot.
+
+### Rotate in Place (CH7 = 2000)
+
+All four wheels turn 90 degrees — the left-side wheels point one way, the right-side wheels point the opposite way. The robot spins on the spot with zero turning radius.
+
+<Callout type="see">
+Nav2 only uses Ackermann mode. The <code>use_rotate_to_heading: false</code> setting in <code>nav2_params.yaml</code> exists because Nav2 cannot switch the control tower's drive mode. The robot CAN rotate in place (the hardware supports it), but Nav2 doesn't know how to trigger the mode switch. A future drive-mode-switcher node could watch <code>cmd_vel</code> and auto-switch between ackermann and rotate modes.
+</Callout>
+
+---
+
+## Control Tower Node
+
+The `control_tower_node` is the bridge between Nav2's velocity commands and the physical wheel motors. It runs on the Pi at 100 Hz (10 ms timer).
+
+### Data flow
+
+```
+Nav2 controller ─► /cmd_vel
+                      │
+              velocity_smoother ─► /cmd_vel_smoothed
+                                      │
+                              collision_monitor ─► /control/cmd_vel
+                                                        │
+                                              control_tower_node
+                                                   │
+                              ┌─────────┬──────────┼──────────┬─────────┐
+                              ▼         ▼          ▼          ▼         │
+                     frontleft/   frontright/  backleft/  backright/    │
+                      control      control     control     control     │
+                         │            │           │           │         │
+                         ▼            ▼           ▼           ▼         ▼
+                     MQTT broker ─────────────────────────────────► ESC µCs
+```
+
+### What the node does each cycle
+
+1. **Reads RC channels** — CH1-CH8 arrive as `Int32` messages from `ibus_reader` at 50 Hz
+2. **Determines control state** — based on CH8 (sw_b): teleop, off, or auto
+3. **Checks e-stop** — if CH6 (sw_d) = 1000, the node returns immediately without publishing anything
+4. **Computes kinematics** — creates a `DoubleAckermannSteering` (or `FixedHeadingSteering` or `RotateSteering`) object from the input
+5. **Publishes wheel commands** — four `Point` messages, one per wheel
+
+### Wheel command format
+
+Each wheel receives a `geometry_msgs/Point` message where:
+
+| Field | Meaning |
+|-------|---------|
+| `x` | Wheel velocity (m/s) |
+| `z` | Steering angle (radians) |
+| `y` | Unused (always 0) |
+
+<CommandBlock command="ros2 topic echo /control/frontleft/control --once" description="Print one wheel command message" />
+
+<TerminalOutput title="Pi — /control/frontleft/control">
+{`x: 0.18
+y: 0.0
+z: 0.0942`}
+</TerminalOutput>
+
+This message tells the front-left wheel to drive at 0.18 m/s with a steering angle of 0.0942 radians (about 5.4 degrees).
+
+### MQTT bridge
+
+The ROS2 `Point` messages don't go directly to the motors. A separate `mqtt_wheel_bridge` node subscribes to the four wheel topics and publishes the values to an MQTT broker running on the Pi. The ESC microcontrollers subscribe to MQTT topics to receive their commands. This two-hop architecture (ROS2 to MQTT to ESC) isolates the motor controllers from the ROS2 network.
+
+### cmd_vel timeout
+
+The control tower implements a 50 ms timeout on incoming `cmd_vel` messages. If no new velocity command arrives within 50 ms, the node clears the last command and stops publishing wheel commands. This is a safety feature — if Nav2 crashes or the network drops, the robot stops within one update cycle rather than continuing at its last commanded velocity.
+
+<Callout type="why">
+The 50 ms timeout is deliberately aggressive. At the robot's max speed of 2.0 m/s, it would travel only 0.1 m (10 cm) before stopping. Nav2's controller publishes at ~20 Hz (50 ms intervals), so the timeout is matched to the expected command rate. If you increase Nav2's controller frequency, the timeout still works. If you decrease it below 20 Hz, you'll need to increase <code>CMD_VEL_TIMEOUT_MS</code> in the source code.
+</Callout>
+
+---
+
+## RC Safety System
+
+The RC transmitter is the ultimate safety authority. The physical joystick can override Nav2 at any time, and the e-stop switch halts all motion instantly.
+
+### Channel mapping
+
+| Switch | Channel | Values | Function |
+|--------|---------|--------|----------|
+| SW_D (right) | CH6 | 1000 = stopped, 2000 = enabled | **E-stop** |
+| SW_B (center-left) | CH8 | 1000 = teleop, 1500 = off, 2000 = auto | **Control state** |
+| SW_A (left) | CH5 | 1000 = forward, 2000 = reverse | **Direction** |
+| SW_C (center-right) | CH7 | 1000 = ackermann, 1500 = heading, 2000 = rotate | **Drive mode** |
+
+### How the safety interlock works
+
+The control tower checks the e-stop FIRST, before anything else in the update loop. If CH6 = 1000, the function returns immediately — no wheel commands are published, regardless of the control state or drive mode.
+
+When CH8 is set to "auto" (2000), the control tower reads from `/control/cmd_vel` (the output of the collision monitor). When CH8 is set to "teleop" (1000), it reads from the joystick sticks (CH1 for steering, CH2 for throttle). When CH8 = 1500 ("off"), no commands are published at all.
+
+### Direction change braking
+
+When the robot is in auto mode and Nav2 requests a direction change (forward to reverse or vice versa), the control tower enforces a 500 ms braking pause. This prevents the motors from instantly reversing under load, which could damage the drivetrain gears.
+
+<Callout type="warning">
+Never publish fake RC channel values from the command line. Auto/teleop switching MUST happen via the physical joystick (Switch B / CH8). Publishing synthetic channel values bypasses the safety interlock — the e-stop check, the direction-change brake, and the control state machine all assume RC values come from real hardware at 50 Hz. Injecting values from the CLI can cause uncontrolled motor behavior with no physical way to stop the robot.
+</Callout>
+
+---
+
+## Hands-on: Inspecting Motor Control
+
+### Check the control state
+
+<CommandBlock command="ros2 topic echo /control/control_state --once" description="See whether the robot is in teleop, off, or auto mode" />
+
+<TerminalOutput title="Pi — /control/control_state">
+{`data: teleop`}
+</TerminalOutput>
+
+### Check the e-stop
+
+<CommandBlock command="ros2 topic echo /control/ch6 --once" description="Check e-stop status (1000=stopped, 2000=enabled)" />
+
+<TerminalOutput title="Pi — /control/ch6">
+{`data: 2000`}
+</TerminalOutput>
+
+A value of 2000 means the e-stop is disengaged and the robot is allowed to move.
+
+### Check auto/teleop mode
+
+<CommandBlock command="ros2 topic echo /control/ch8 --once" description="Check control mode (1000=teleop, 1500=off, 2000=auto)" />
+
+<TerminalOutput title="Pi — /control/ch8">
+{`data: 1000`}
+</TerminalOutput>
+
+A value of 1000 means the robot is in teleop mode — it will respond to the joystick sticks, not Nav2.
+
+### Watch wheel commands live
+
+<CommandBlock command="ros2 topic echo /control/frontleft/control" description="Stream front-left wheel commands (Ctrl+C to stop)" />
+
+<TerminalOutput title="Pi — /control/frontleft/control (while driving)">
+{`x: 0.25
+y: 0.0
+z: 0.1047
+---
+x: 0.25
+y: 0.0
+z: 0.1047
+---
+x: 0.24
+y: 0.0
+z: 0.0873
+---
+x: 0.0
+y: 0.0
+z: 0.0
+---`}
+</TerminalOutput>
+
+The last message (all zeros) appears when the robot stops — either the joystick returned to center or the cmd_vel timeout fired.
+
+### Check the drive mode
+
+<CommandBlock command="ros2 topic echo /control/drive_mode --once" description="See the active drive mode" />
+
+<TerminalOutput title="Pi — /control/drive_mode">
+{`data: ackermann`}
+</TerminalOutput>
+
+---
+
+## Failure Gallery
+
+### Robot doesn't move in auto mode
+
+**Symptom:** Nav2 sends goals, the planner computes a path (visible in RViz2), but the robot sits still. No wheel commands appear on the `/control/frontleft/control` topic.
+
+**Diagnosis:**
+
+<CommandBlock command="ros2 topic echo /control/ch8 --once" description="Check if auto mode is active" />
+
+<TerminalOutput title="Pi — CH8 shows teleop, not auto">
+{`data: 1000`}
+</TerminalOutput>
+
+**Root cause:** CH8 = 1000 means teleop mode. The control tower ignores `cmd_vel` entirely in teleop mode. Flip Switch B to auto (CH8 = 2000).
+
+Also check the e-stop:
+
+<CommandBlock command="ros2 topic echo /control/ch6 --once" description="Check if e-stop is engaged" />
+
+If CH6 = 1000, the e-stop is on. The control tower returns immediately without publishing any wheel commands, regardless of the control state. Flip Switch D to disengage.
+
+### Wheels turn wrong direction
+
+**Symptom:** The robot receives Nav2 commands and the wheels move, but the steering angles seem wrong — the robot curves away from the goal instead of toward it.
+
+**Diagnosis:**
+
+<CommandBlock command="ros2 topic echo /control/drive_mode --once" description="Verify the drive mode is ackermann" />
+
+<TerminalOutput title="Pi — wrong drive mode">
+{`data: heading`}
+</TerminalOutput>
+
+**Root cause:** CH7 is set to 1500 (fixed heading) instead of 1000 (ackermann). In fixed heading mode, all four wheels point the same direction — there's no differential steering. The kinematics are completely different from what Nav2 expects. Set Switch C to the ackermann position (CH7 = 1000).
+
+### cmd_vel timeout — robot freezes mid-path
+
+**Symptom:** The robot is following a path, then suddenly stops. After a few seconds it may resume, or Nav2 may abort the goal.
+
+**Diagnosis:**
+
+<CommandBlock command="ros2 topic hz /control/cmd_vel" description="Check if cmd_vel is being published" />
+
+<TerminalOutput title="Laptop — cmd_vel rate drops to zero">
+{`average rate: 19.834
+	min: 0.048s max: 0.054s std dev: 0.00178s window: 20
+average rate: 0.000
+	min: 0.000s max: 0.000s std dev: 0.00000s window: 0`}
+</TerminalOutput>
+
+**Root cause:** Nav2's controller stopped publishing `cmd_vel`. Common causes: the costmap detected an obstacle and the controller couldn't find a valid trajectory, or the global plan was invalidated and the planner is recomputing. The 50 ms timeout correctly stops the robot. Once Nav2 resumes publishing, the robot will start moving again.
+
+---
+
+## Try It
+
+### Level 1: Observe
+
+Echo all four wheel topics simultaneously. Open four terminals and run one in each:
+
+<CommandBlock command="ros2 topic echo /control/frontleft/control --once" description="Front-left wheel" />
+<CommandBlock command="ros2 topic echo /control/frontright/control --once" description="Front-right wheel" />
+<CommandBlock command="ros2 topic echo /control/backleft/control --once" description="Back-left wheel" />
+<CommandBlock command="ros2 topic echo /control/backright/control --once" description="Back-right wheel" />
+
+With the robot in teleop mode, steer gently to the right. Compare the `z` values (steering angles) across the four wheels. You should see:
+- Front-left and front-right have small positive (or negative) angles
+- Back-left and back-right have the **opposite sign** from the fronts
+- The inner wheel (closer to the turn) has a slightly larger angle than the outer wheel
+
+<Callout type="see">
+The angle difference between inner and outer wheels is the Ackermann correction. If both front wheels had the same angle, their arcs would intersect and the tires would scrub. The <code>atan2</code> formulas give each wheel the exact angle needed to roll without slipping.
+</Callout>
+
+### Level 2: Trace the Pipeline
+
+With the full Nav2 stack running and a goal active, trace a velocity command from Nav2 to the wheels:
+
+1. Echo `/cmd_vel` — the raw output from Nav2's controller
+2. Echo `/cmd_vel_smoothed` — after the velocity smoother
+3. Echo `/control/cmd_vel` — after the collision monitor
+4. Echo `/control/frontleft/control` — the final wheel command
+
+Compare `linear.x` in the Twist messages to the `x` field in the Point message. They won't match exactly — the velocity smoother limits acceleration, the collision monitor may scale down velocity near obstacles, and the double Ackermann kinematics distribute velocity differently to each wheel.
+
+### Level 3: Compute by Hand
+
+Pick a `cmd_vel` message where `angular.z` is nonzero. Using the formulas from this module, compute the expected steering angles and wheel velocities by hand:
+
+1. Compute the steering angle: `angle = angular.z` (clamped to +/- 45 degrees)
+2. Compute the turning radius: `R = 0.711 / tan(angle)`
+3. Front-left angle: `atan2(0.3555, R + 0.279)`
+4. Front-right angle: `atan2(0.3555, R - 0.279)`
+5. Rear angles: negate the fronts
+6. Angular velocity: `omega = linear.x / R`
+7. Inner velocity: `omega * (R - 0.279)`, outer: `omega * (R + 0.279)`
+
+Compare your hand calculations to the actual wheel topic values. They should match within rounding error.
+
+---
+
+**Next module:** [M11: Behavior Trees](/modules/11-behavior-tree) -- how Nav2 orchestrates recovery behaviors when the robot gets stuck.

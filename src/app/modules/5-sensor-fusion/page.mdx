@@ -1,0 +1,434 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M5: Sensor Fusion
+
+EKF localization — combining LiDAR odometry and IMU into one smooth estimate.
+
+---
+
+## Learning Objectives
+
+By the end of this module you will understand:
+
+- Why fusing multiple sensors produces better localization than any single sensor alone
+- How the Extended Kalman Filter (EKF) predict-update cycle works (intuitive, no heavy math)
+- How to read and interpret every line of `ekf.yaml`
+- What the local EKF output (`/odometry/local`) contains and why Nav2 depends on it
+
+**Prerequisites:** [M2: IMU](/modules/2-imu) and [M4: Odometry](/modules/4-odometry). You should already know what KISS-ICP odometry and IMU angular velocity are before starting this module.
+
+---
+
+## The Problem: One Sensor Is Not Enough
+
+You have two sensors that both tell you something about how the robot is moving:
+
+1. **KISS-ICP** (LiDAR odometry) — matches successive point clouds to estimate position (x, y) and heading (yaw). It runs at about 10 Hz, which means one update every 100 ms. When it does update, it is very accurate because it is based on geometry — matching thousands of laser points against each other.
+
+2. **BNO085 IMU gyroscope** — measures angular velocity (how fast the robot is rotating) at 100 Hz. It updates ten times between each KISS-ICP scan. It detects rotation instantly. But gyroscope readings drift over time — small biases accumulate, and after a few minutes the heading estimate can be off by several degrees.
+
+Here is the problem in concrete terms. Imagine the robot is driving forward and starts a sharp right turn:
+
+```
+Time:    0ms         50ms        100ms
+KISS:    [scan]                  [scan]
+IMU:     [gyro] [gyro] [gyro] [gyro] [gyro] [gyro] [gyro] [gyro] [gyro] [gyro]
+```
+
+With only KISS-ICP, you get one position update at 0 ms and another at 100 ms. Between those updates you have **no idea** the robot turned. The heading jumps suddenly when the next scan arrives. Downstream systems like the Nav2 controller see a jerky heading signal, which causes jerky steering commands.
+
+With only the IMU gyro, you get smooth rotation estimates every 10 ms, but after a few minutes of driving, the accumulated drift means you think you are facing a wall when you are actually facing a hallway.
+
+Neither sensor alone is good enough. But notice that their weaknesses are complementary:
+
+| Sensor | Strength | Weakness |
+|--------|----------|----------|
+| KISS-ICP | Accurate position and heading | Slow (10 Hz), no data between scans |
+| IMU gyro | Fast (100 Hz), smooth rotation | Drifts over time, no position |
+
+What you need is a system that uses the IMU gyro to fill in the gaps between KISS-ICP scans, and uses KISS-ICP to correct the gyro drift whenever a new scan arrives. That system is the Extended Kalman Filter.
+
+<Callout type="why">
+  This "complementary sensors" pattern shows up everywhere in robotics. GPS is accurate but slow and drops out indoors. Wheel encoders are fast but slip on wet surfaces. Cameras are rich but fail in darkness. Sensor fusion is not optional for real-world robots — it is the only way to get reliable localization from imperfect sensors.
+</Callout>
+
+---
+
+## The EKF: An Intuitive Explanation
+
+The Extended Kalman Filter (EKF) is a mathematical algorithm that combines multiple noisy sensor measurements into a single, better estimate of the robot's state. Here is how it works, without the math.
+
+### The Two-Step Cycle
+
+The EKF repeats two steps over and over, 15 times per second on this robot:
+
+**Step 1 — Predict.** Based on what the EKF already knows (the robot's last estimated position, velocity, and heading), it predicts where the robot should be *right now*. This prediction uses the robot's motion model: "if I was moving at 0.5 m/s heading north, and 67 ms have passed, I should now be about 33 mm further north."
+
+The prediction is never perfect. The EKF knows this, so it also increases its **uncertainty** — a number that represents how confident it is in the estimate. The longer it goes without a sensor update, the more uncertain it becomes.
+
+**Step 2 — Update.** A new sensor measurement arrives — say, a KISS-ICP position fix. The EKF compares the measurement to its prediction: "I predicted I was at (1.02, 0.55), and KISS-ICP says I am at (1.03, 0.54)." Then it blends the two, weighted by how much it trusts each one.
+
+The key insight: **the EKF weights each source by its covariance** (uncertainty). Low covariance means "I am very confident in this value." High covariance means "this could be off by a lot."
+
+- If KISS-ICP says x=1.03 with low covariance (high confidence), and the EKF's prediction says x=1.02 with high covariance (low confidence), the result will be close to 1.03.
+- If both have similar covariance, the EKF splits the difference.
+- After the update, the EKF's uncertainty *decreases* — it is now more confident than either source alone.
+
+### Why "Extended"?
+
+A plain Kalman Filter works for linear systems. Robot motion is nonlinear (turning changes the relationship between velocity and position), so the EKF uses a linearization trick to handle this. You do not need to understand the linearization to use the EKF effectively. Just know that "Extended" means "works for robots that turn."
+
+### The Result
+
+The EKF runs this predict-update cycle at 15 Hz (`frequency: 15.0` in the config). Each cycle, it ingests whatever sensor data has arrived since the last cycle — possibly multiple IMU gyro readings and zero or one KISS-ICP updates — and produces one fused output: the robot's estimated position, orientation, and velocity.
+
+That output is published to `/odometry/local`. Every downstream Nav2 node (controller, costmaps, collision monitor) reads this single topic instead of dealing with raw sensor data directly.
+
+---
+
+## The Config File: `ekf.yaml`
+
+The EKF's behavior is entirely controlled by one file: `ekf.yaml` in the `nav2_schoolbus/config/` directory. Let's walk through it section by section.
+
+### Local EKF Header
+
+```yaml
+ekf_filter_node_odom:
+    ros__parameters:
+        frequency: 15.0
+        sensor_timeout: 0.2
+        two_d_mode: true
+        transform_time_offset: 0.3
+        publish_tf: true
+
+        odom_frame: odom
+        base_link_frame: base_footprint
+        world_frame: odom
+```
+
+This configures the **local EKF** — the one that produces the odometry Nav2 actually uses. There is also a global EKF (covered later), but the local one is the important one for indoor navigation.
+
+| Parameter | Value | What It Does |
+|-----------|-------|--------------|
+| `frequency` | `15.0` | EKF runs its predict-update cycle 15 times per second |
+| `sensor_timeout` | `0.2` | If a sensor goes silent for 200 ms, the EKF keeps predicting without it |
+| `two_d_mode` | `true` | Forces z=0, roll=0, pitch=0 — this is a ground robot |
+| `transform_time_offset` | `0.3` | Publishes TF 300 ms into the future so the TF buffer has entries around scan timestamps |
+| `publish_tf` | `true` | This EKF publishes the `odom` to `base_footprint` transform |
+| `world_frame` | `odom` | This EKF operates in the local odometry frame, not the global map frame |
+
+---
+
+## The 15-Element Config Matrix
+
+This is the most important part of `ekf.yaml` and the part that confuses people the most. Each sensor input has a `_config` parameter: a 15-element boolean array that tells the EKF exactly which measurements to fuse from that sensor.
+
+The 15 elements map to these state variables, in order:
+
+```
+[ x,     y,     z,        # position
+  roll,  pitch, yaw,      # orientation
+  vx,    vy,    vz,       # linear velocity
+  vroll, vpitch, vyaw,    # angular velocity
+  ax,    ay,    az ]      # linear acceleration
+```
+
+`true` means "use this measurement from this sensor." `false` means "ignore it, even if the sensor provides it."
+
+### KISS-ICP Config: Position and Heading
+
+```yaml
+odom0: /kiss/odometry
+odom0_config: [true,  true,  false,   # x, y fused; z ignored
+               false, false, true,    # yaw fused; roll, pitch ignored
+               false, false, false,   # no velocities from KISS-ICP
+               false, false, false,
+               false, false, false]
+```
+
+Walking through each decision:
+
+- **x, y = true**: KISS-ICP computes position by matching point clouds. This is the primary position source.
+- **z = false**: The robot drives on a flat floor. Estimating z would just add noise. (Also enforced by `two_d_mode: true`.)
+- **roll, pitch = false**: A ground robot does not roll or pitch meaningfully. Ignoring these reduces noise.
+- **yaw = true**: KISS-ICP's heading estimate comes from scan matching — it is relative to the robot's startup heading, which is consistent with the local odometry frame.
+- **All velocities = false**: KISS-ICP computes pose (where you are), not velocity (how fast you are moving). The EKF can derive velocity from successive position estimates internally.
+- **All accelerations = false**: KISS-ICP does not produce acceleration data.
+
+Out of 15 possible channels, only three are enabled: x, y, and yaw. This is deliberate. You should only fuse measurements that a sensor actually provides with useful accuracy. Enabling unused or inaccurate channels injects noise.
+
+### IMU Config: Angular Velocity Only
+
+```yaml
+imu0: /imu/BNO085_filtered
+imu0_config: [false, false, false,    # no position from IMU
+              false, false, false,    # no orientation (see Magnetometer Saga)
+              false, false, false,    # no linear velocity
+              true,  true,  true,    # angular velocity — YES
+              false, false, false]   # no linear acceleration
+imu0_remove_gravitational_acceleration: false
+```
+
+Walking through each decision:
+
+- **Position (x, y, z) = false**: An IMU cannot measure position. It measures acceleration, and double-integrating acceleration to get position accumulates enormous error. Nobody does this.
+- **Orientation (roll, pitch, yaw) = false**: This is the hard-won lesson from the magnetometer saga (next section). The BNO085 computes orientation using magnetic north, which conflicts with KISS-ICP's relative heading. Fusing both causes map distortion.
+- **Linear velocity = false**: The IMU does not measure velocity. You could integrate acceleration to estimate it, but the error accumulates quickly.
+- **Angular velocity (vroll, vpitch, vyaw) = true**: This is the gyroscope output — how fast the robot is rotating around each axis. This is the one thing the IMU does better than anything else: smooth, 100 Hz rotation rate measurements that fill the gaps between KISS-ICP scans.
+- **Linear acceleration = false**: We chose not to fuse this because gravitational acceleration contaminates the signal and the benefit is marginal for a slow ground robot.
+- **`imu0_remove_gravitational_acceleration: false`**: This flag only matters when fusing linear acceleration, which we are not. Since angular velocity is unaffected by gravity, this setting has no effect. It is left as `false` to avoid unnecessary computation.
+
+<Callout type="why">
+  The config matrix is the EKF's most powerful feature. It lets you hand-pick exactly which measurements from each sensor to trust. Getting this matrix right is the difference between smooth navigation and a robot that thinks it is inside a wall. Every `true` should have a reason. Every `false` should have a reason too.
+</Callout>
+
+---
+
+## The Magnetometer Saga
+
+The `ekf.yaml` file contains a block of comments that tell the story of a real debugging session. This is worth reading in full, because you will encounter the same trap if you ever work with IMU orientation indoors.
+
+### What Happened
+
+The BNO085 IMU has an onboard sensor fusion processor that computes absolute orientation by blending its accelerometer, gyroscope, and magnetometer. Its heading output is referenced to **magnetic north** — like a compass, it tells you which direction the robot is facing relative to the Earth's magnetic field.
+
+KISS-ICP computes heading differently. It starts at zero when the node launches, and tracks heading changes by matching successive point clouds. Its heading is **relative** to the robot's startup orientation.
+
+Both of these heading estimates were fed into the EKF:
+
+```
+BNO085 yaw:   "you are facing 47 degrees east of magnetic north"
+KISS-ICP yaw: "you have turned 12 degrees right since startup"
+```
+
+These are measured in completely different reference frames. Indoors, magnetic interference from steel structures, electrical wiring, and motors distorts the magnetic field by 90 to 180 degrees. The BNO085 might report "facing north" when the robot is actually facing east.
+
+The EKF tried to reconcile these incompatible headings by splitting the difference. The result: a slowly drifting heading error that caused SLAM maps to warp into a **fan shape**, where straight walls appeared to rotate outward.
+
+### The Evidence in the Config
+
+The fix is documented right in `ekf.yaml`:
+
+```yaml
+#* DISABLED: BNO085 provides absolute yaw in ENU (magnetic north reference).
+#* KISS-ICP yaw uses robot startup heading as reference. These two reference frames
+#* differ by ~90-180 degrees indoors (magnetic interference), causing EKF to blend
+#* incompatible yaw estimates -> systematic rotation -> fan/creep map artifact.
+#* KISS-ICP at voxel_size=0.08m provides sufficient yaw for indoor SLAM.
+```
+
+Below that comment sits the old config with orientation enabled — all commented out:
+
+```yaml
+# imu0_config: [false, false, false,
+#               true, true, true,      # <-- orientation was ON
+#               false, false, false,
+#               true, true, true,      # angular velocity
+#               true, true, true]      # linear acceleration
+```
+
+The fix was to replace this with the current config that only fuses angular velocity. Angular velocity (how fast you are rotating) does not depend on any reference frame, so there is no conflict between the IMU gyro and KISS-ICP.
+
+<Callout type="warning">
+  If you see the commented-out BNO085 orientation block in <code>ekf.yaml</code> and think "I should uncomment this for better accuracy" — stop. Those comments are battle scars. Enabling magnetic yaw indoors will cause your SLAM maps to distort into a fan shape. The only reliable heading source for indoor navigation is scan matching (KISS-ICP), not the magnetometer.
+</Callout>
+
+---
+
+## `two_d_mode` and Other Key Parameters
+
+### `two_d_mode: true`
+
+This single parameter eliminates three dimensions from the EKF's state estimate. When enabled, the EKF forces:
+
+- **z = 0** (no vertical position)
+- **roll = 0** (no tilt left/right)
+- **pitch = 0** (no tilt forward/back)
+
+For a ground robot driving on a flat floor, this is essential. Without it, the EKF would try to estimate z, roll, and pitch from noisy sensor data. Since the robot never leaves the ground, those estimates would just be noise — and that noise would leak into the x, y, and yaw estimates through the EKF's internal covariance matrix.
+
+Enabling `two_d_mode` is not just ignoring irrelevant dimensions. It makes the remaining estimates (x, y, yaw) **more accurate** by preventing noise from contaminating them.
+
+### `frequency: 15.0`
+
+The EKF runs its predict-update cycle 15 times per second. This is higher than KISS-ICP's ~10 Hz input rate, which means the EKF interpolates between KISS-ICP updates using IMU gyro data. Between KISS-ICP scans, the EKF runs predict-only cycles (using the gyro for heading), then corrects when the next scan arrives.
+
+The output rate on `/odometry/local` matches this 15 Hz setting. In practice, the measured rate is slightly lower (~9.4 Hz) because of system load and timing jitter on the Raspberry Pi.
+
+### `transform_time_offset: 0.3`
+
+This parameter tells the EKF to publish its TF transform (odom to base_footprint) with a timestamp 300 ms in the future. This sounds strange, but it solves a real timing problem.
+
+SLAM Toolbox and Nav2 need to look up the robot's position in the TF tree at the timestamp of a laser scan. If the EKF only published TF for the current time, by the time SLAM Toolbox processes the scan (a few hundred milliseconds later), the TF entry might have expired from the buffer. By publishing 300 ms into the future, the EKF ensures there is always a valid TF entry available when downstream nodes need it.
+
+### `publish_tf: true`
+
+The local EKF publishes the `odom` to `base_footprint` TF transform. This is the transform that tells the rest of the system where the robot is within the odometry frame. Without this, SLAM Toolbox and Nav2 cannot function.
+
+The global EKF has `publish_tf: false` because only one node should publish each TF transform. If both EKFs published `odom` to `base_footprint`, TF would receive conflicting data and downstream nodes would get erratic position estimates.
+
+---
+
+## Hands-On: Comparing KISS-ICP vs EKF Output
+
+Let's look at real data captured from the robot while stationary and see what the EKF actually produces.
+
+### Raw KISS-ICP Output
+
+<CommandBlock command="ros2 topic echo /kiss/odometry --once" description="Print one KISS-ICP odometry message" />
+
+KISS-ICP publishes its pose estimate with a uniform covariance. Every diagonal element of the 6x6 pose covariance matrix is set to **0.1**. This is a default value — KISS-ICP does not dynamically compute its own uncertainty. It simply says "I am moderately confident in all axes equally."
+
+### Fused EKF Output
+
+<CommandBlock command="ros2 topic echo /odometry/local --once" description="Print one fused EKF odometry message" />
+
+<TerminalOutput title="Laptop — /odometry/local (stationary robot)">
+{`header:
+  stamp:
+    sec: 1777545712
+    nanosec: 377078368
+  frame_id: odom
+child_frame_id: base_footprint
+pose:
+  pose:
+    position:
+      x: 0.0011
+      y: 0.0012
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0006
+      w: 1.0
+  covariance:
+  - 0.0491
+  ...
+twist:
+  twist:
+    linear:
+      x: -0.0026
+      y: -0.0017
+      z: 0.0
+    angular:
+      x: 0.0
+      y: 0.0
+      z: -0.0004`}
+</TerminalOutput>
+
+### What to Notice
+
+**Frame IDs.** The EKF output has `frame_id: odom` and `child_frame_id: base_footprint`. This is the local EKF — it expresses the robot's position in the odometry frame.
+
+**Position.** The robot is stationary, so position should be near zero. The values `x: 0.0011, y: 0.0012` (about 1 mm) represent the residual uncertainty in the estimate — the EKF has not converged to exactly zero because there is always some noise.
+
+**z = 0.0.** This is `two_d_mode` at work. KISS-ICP might report a small nonzero z due to point cloud noise, but the EKF forces it to zero.
+
+**Orientation.** The quaternion `(0, 0, 0.0006, 1.0)` represents a yaw of approximately 0.0012 radians (0.07 degrees). Essentially zero, as expected for a stationary robot.
+
+**Covariance: 0.0491.** This is the most important number. The EKF's x-position variance is 0.0491, compared to KISS-ICP's default variance of 0.1. The EKF is **more confident** than KISS-ICP alone. This is the whole point of sensor fusion — by combining multiple sources, the filter arrives at an estimate it trusts more than any individual source.
+
+**Velocity.** The twist values (`linear.x: -0.0026`, `angular.z: -0.0004`) are not exactly zero. These are the EKF's velocity estimates based on the rate of change of position and heading. For a stationary robot, they represent noise in the system — a few mm/s of apparent motion. This is normal and well within the tolerance of downstream controllers.
+
+<Callout type="see">
+  Side-by-side comparison: KISS-ICP has uniform 0.1 covariance (a fixed default). The EKF computes 0.0491 (a dynamic estimate based on actual sensor agreement). The EKF's lower covariance means it is more confident in its position estimate than KISS-ICP alone. This is sensor fusion working as intended.
+</Callout>
+
+---
+
+## The Global EKF
+
+The `ekf.yaml` file defines a second EKF instance: `ekf_filter_node_map`. This is the **global EKF**, and it works in the map frame rather than the odometry frame.
+
+```yaml
+ekf_filter_node_map:
+    ros__parameters:
+        world_frame: map
+        publish_tf: false
+```
+
+The key differences from the local EKF:
+
+| Property | Local EKF | Global EKF |
+|----------|-----------|------------|
+| Node name | `ekf_filter_node_odom` | `ekf_filter_node_map` |
+| World frame | `odom` | `map` |
+| Publishes TF | Yes (`odom` to `base_footprint`) | No |
+| KISS-ICP config | x, y, yaw only | Full pose (x, y, z, roll, pitch, yaw) |
+| IMU source | BNO085 angular velocity | LSM6DSOX orientation (differential mode) |
+
+The global EKF fuses KISS-ICP with the **LSM6DSOX** IMU in differential mode. Differential mode means the EKF uses changes in orientation rather than absolute values, which avoids the reference frame conflict that plagued the BNO085 (since changes in heading are the same regardless of reference frame).
+
+The global EKF has `publish_tf: false` because the `map` to `odom` transform is published by SLAM Toolbox, not the EKF. Having two nodes publish the same transform would cause conflicts.
+
+For indoor Nav2 navigation, the local EKF (`/odometry/local`) is the one that matters. Nav2's controller, costmaps, and collision monitor all subscribe to it.
+
+---
+
+## Why This Matters for Navigation
+
+<Callout type="why">
+  The EKF is the bridge between raw sensors and autonomous navigation. Nav2 does not subscribe to <code>/kiss/odometry</code> or <code>/imu/BNO085_filtered</code> directly. It subscribes to <code>/odometry/local</code> — the EKF's fused output. Every Nav2 decision (path planning, obstacle avoidance, goal reaching) depends on this single topic being accurate. If the EKF output is wrong, the robot thinks it is somewhere it is not, and it will drive into walls, overshoot goals, or spin in circles.
+</Callout>
+
+The data flow from sensors to navigation looks like this:
+
+```
+KISS-ICP (/kiss/odometry)     ──┐
+                                ├── EKF (/odometry/local) ──→ Nav2
+BNO085 gyro (/imu/BNO085_filtered) ─┘
+```
+
+Every parameter in `ekf.yaml` has a physical consequence:
+
+- Change `two_d_mode` to `false` and the robot's position estimate starts drifting vertically on a flat floor.
+- Enable BNO085 orientation and SLAM maps warp into a fan shape.
+- Set `frequency` too low and the controller gets jerky position updates.
+- Set `transform_time_offset` too small and SLAM Toolbox cannot look up TF at scan timestamps.
+
+Understanding the EKF config is not optional knowledge for debugging a Nav2 robot. When the robot misbehaves, the first question is always: "is the odometry accurate?" And the answer is always in `ekf.yaml`.
+
+---
+
+## Try It
+
+### Level 1: Compare Raw and Fused Odometry
+
+Echo both odometry topics and compare the covariance values.
+
+<CommandBlock command="ros2 topic echo /odometry/local --once" description="Print one fused EKF odometry message" />
+
+<CommandBlock command="ros2 topic echo /kiss/odometry --once" description="Print one raw KISS-ICP odometry message" />
+
+Questions to answer:
+- What is the first covariance value in `/odometry/local`? What about `/kiss/odometry`?
+- Which topic has lower covariance (higher confidence)?
+- Is `position.z` exactly zero in the EKF output? Why?
+
+### Level 2: Inspect the EKF Node
+
+<CommandBlock command="ros2 node info /ekf_filter_node_odom" description="Show the local EKF node's subscriptions and publications" />
+
+Questions to answer:
+- What topics does the EKF subscribe to? (You should see `/kiss/odometry` and `/imu/BNO085_filtered`.)
+- What topics does it publish? (Look for `/odometry/local` and `/tf`.)
+- Does it publish to `/tf` or `/tf_static`? What is the difference?
+
+### Level 3: Thought Experiment — Changing `two_d_mode`
+
+Open the EKF config file:
+
+<CommandBlock command="cat ~/ros2_ws/src/nav2_schoolbus/config/ekf.yaml" description="View the full EKF config" />
+
+Find the `two_d_mode: true` line. What would happen if you changed it to `false`?
+
+**Answer:** The EKF would start estimating z, roll, and pitch. For a ground robot on a flat floor, the z position would drift randomly based on sensor noise (KISS-ICP occasionally reports small z values from point cloud jitter). Roll and pitch would fluctuate based on IMU noise. Worse, this noise would couple into the x, y, and yaw estimates through the EKF's covariance matrix, making the position estimate less stable overall. Constraining to 2D is not losing information — it is preventing noise from corrupting the estimates that actually matter.
+
+---
+
+## What's Next
+
+- **[M6: SLAM](/modules/6-slam)** — Now that you understand how the EKF produces smooth odometry, the next step is using that odometry (plus laser scans) to build a map of the environment. SLAM Toolbox consumes `/odometry/local` and `/velodyne_scan` to produce the map that Nav2 navigates on.
+- **[M4: Odometry](/modules/4-odometry)** — If you skipped it, go back and understand how KISS-ICP produces the `/kiss/odometry` topic that feeds into the EKF.

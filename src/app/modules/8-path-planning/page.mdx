@@ -1,0 +1,417 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M8: Path Planning
+
+Given a map of obstacles, find a path the robot can actually drive.
+
+---
+
+## Prerequisites
+
+Complete [M7: Costmaps](/modules/7-costmaps) before starting this module. You need a working costmap to plan paths against.
+
+---
+
+## Learning Objectives
+
+By the end of this module you will be able to:
+
+- Explain why standard A* grid search does not work for Ackermann-steered vehicles
+- Describe how Hybrid A* plans in (x, y, theta) state space using motion primitives
+- Identify the six types of Dubins curves and why the school bus uses them
+- Read and interpret a Nav2 path message
+- Tune the SmacPlannerHybrid parameters for a real robot
+
+---
+
+## The Path Planning Problem
+
+In M7 you built a costmap — a grid where every cell has a cost representing how dangerous it is to drive there. The path planner's job is to find a sequence of poses from the robot's current position to a goal that avoids high-cost cells.
+
+The simplest approach is A* on a 2D grid. A* finds the shortest path by expanding cells in order of estimated total cost (distance traveled so far plus a heuristic estimate to the goal). It is fast, well-understood, and optimal on a grid.
+
+There is one problem: A* treats the robot as a point that can move in any direction — up, down, left, right, diagonal. It ignores heading entirely. The path it produces might include 90-degree corners or instant direction reversals.
+
+The school bus cannot do this. It has double-Ackermann steering with a minimum turning radius of 0.75 meters. To turn 90 degrees it must sweep through an arc, not pivot on the spot. A path with sharp corners is physically impossible to follow — the controller will oscillate trying to track it, or simply fail.
+
+<Callout type="why">A path planner for an Ackermann vehicle must be aware of kinematics. It is not enough to find a collision-free set of (x, y) waypoints. Every waypoint must also include a heading (theta), and every transition between waypoints must respect the vehicle's turning constraints. This is the core motivation for Hybrid A*.</Callout>
+
+---
+
+## Hybrid A*
+
+Hybrid A* extends the classic A* algorithm from a 2D grid to a 3D state space: (x, y, theta). Each node in the search graph is not just a grid cell but a pose — a position plus a heading.
+
+### How it differs from regular A*
+
+| Property | Regular A* | Hybrid A* |
+|----------|-----------|-----------|
+| State | (x, y) grid cell | (x, y, theta) pose |
+| Neighbors | 4 or 8 adjacent cells | Motion primitives (arcs and straights) |
+| Path shape | Jagged grid lines | Smooth, kinematically feasible curves |
+| Heading | Ignored | Tracked at every node |
+
+### Motion primitives
+
+Instead of stepping to an adjacent cell, Hybrid A* expands a node by simulating short forward motions. Each motion primitive is a small arc or straight-line segment that the vehicle can physically execute given its steering limits. The planner tries a set of discrete steering angles, projects the robot forward along each resulting arc, and checks whether the endpoint is collision-free in the costmap.
+
+On the school bus, the heading space is divided into **72 bins** (the `angle_quantization_bins` parameter), giving 360/72 = **5-degree resolution**. This means the planner distinguishes between a robot facing north versus a robot facing 5 degrees east of north. Finer resolution gives smoother paths but multiplies the search space.
+
+### Analytic expansion
+
+Hybrid A* has a performance trick. During search, it periodically tries to connect the current node directly to the goal using an analytical curve (a Dubins path — explained next). If the analytical path is collision-free, the search terminates immediately without expanding more nodes. This is the **analytic expansion** and it is why Hybrid A* can solve large planning problems in real time.
+
+The `analytic_expansion_ratio` parameter (3.5 on the school bus) controls how often this shortcut is attempted. A value of 3.5 means it tries an analytical connection every time the search has expanded 3.5 times more nodes than the minimum expected.
+
+---
+
+## Dubins Curves
+
+A Dubins curve is the shortest path between two oriented points (each with an x, y, and heading) under two constraints:
+
+1. The vehicle can only move **forward** (no reversing)
+2. The vehicle has a **minimum turning radius**
+
+Lester Dubins proved in 1957 that the optimal path always consists of at most three segments, where each segment is either a straight line (S), a left arc at minimum radius (L), or a right arc at minimum radius (R). There are exactly six possible combinations:
+
+| Type | Segments | Shape |
+|------|----------|-------|
+| LSL | Left turn, Straight, Left turn | S-curve left |
+| RSR | Right turn, Straight, Right turn | S-curve right |
+| LSR | Left turn, Straight, Right turn | Crossing curve |
+| RSL | Right turn, Straight, Left turn | Crossing curve |
+| RLR | Right turn, Left turn, Right turn | All-turn path |
+| LRL | Left turn, Right turn, Left turn | All-turn path |
+
+The planner evaluates all six types for the given start and goal poses and picks the shortest one that is collision-free.
+
+<Callout type="why">The school bus uses the DUBIN motion model (not REEDS_SHEPP) because it does not allow reversing during autonomous navigation. Reeds-Shepp curves include reverse segments, which would require the control tower to switch between forward and reverse driving modes — something Nav2 cannot trigger automatically on this robot. Forward-only Dubins curves match the robot's actual capability.</Callout>
+
+### Why not Reeds-Shepp?
+
+Reeds-Shepp paths are the same concept but with reversing allowed. They can produce shorter paths in tight spaces (imagine parallel parking). But on the school bus, `allow_reversing` is false in the controller, and the control tower needs an explicit drive mode switch to go backward. Using REEDS_SHEPP would produce paths the robot cannot follow.
+
+---
+
+## SmacPlannerHybrid Configuration
+
+Here is the full planner configuration from `nav2_params.yaml`, broken into logical groups.
+
+### Plugin registration
+
+```yaml
+planner_server:
+  ros__parameters:
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+```
+
+The planner is registered under the alias `GridBased`. This name is a Nav2 convention — it does not mean the planner is a simple grid planner. Any planner plugin can use this alias.
+
+### Search limits
+
+```yaml
+tolerance: 0.25
+max_iterations: 1000000
+max_on_approach_iterations: 1000
+max_planning_time: 5.0
+allow_unknown: true
+```
+
+- **`tolerance: 0.25`** — the planner succeeds if it reaches within 25 cm of the goal. This allows the planner to find a solution even if the exact goal cell is slightly obstructed.
+- **`max_iterations: 1000000`** — one million node expansions before giving up. This is generous — most indoor plans complete in a few thousand iterations.
+- **`max_on_approach_iterations: 1000`** — once the search reaches the tolerance zone around the goal, it gets 1000 more iterations to find the best approach angle.
+- **`max_planning_time: 5.0`** — hard time limit of 5 seconds. If the planner has not found a path by then, it reports failure.
+- **`allow_unknown: true`** — the planner can plan through gray (unknown) cells in the costmap. Without this, unexplored areas become impassable barriers, which is too restrictive indoors where the map is often incomplete.
+
+### Motion model and kinematics
+
+```yaml
+motion_model_for_search: "DUBIN"
+angle_quantization_bins: 72
+minimum_turning_radius: 0.75
+```
+
+- **`motion_model_for_search: "DUBIN"`** — forward-only Dubins curves. The alternative is `"REEDS_SHEPP"` which adds reverse motion primitives.
+- **`angle_quantization_bins: 72`** — divides 360 degrees into 72 bins of 5 degrees each. Each grid cell can hold 72 different heading states. More bins means smoother paths but a larger search space.
+- **`minimum_turning_radius: 0.75`** — the tightest arc the planner will produce, in meters. This must match or exceed the physical vehicle's minimum turning radius.
+
+### Costmap handling
+
+```yaml
+downsample_costmap: false
+downsampling_factor: 1
+lookup_table_size: 20.0
+cache_obstacle_heuristic: false
+```
+
+- **`downsample_costmap: false`** — uses the costmap at full resolution. Downsampling speeds up planning but loses detail in tight spaces.
+- **`lookup_table_size: 20.0`** — the heuristic lookup table covers a 20-meter radius. This should be larger than the longest expected path.
+- **`cache_obstacle_heuristic: false`** — recomputes the obstacle heuristic for every planning request. Caching speeds up replanning but uses more memory.
+
+### Cost penalties
+
+```yaml
+reverse_penalty: 2.0
+change_penalty: 0.0
+non_straight_penalty: 1.2
+cost_penalty: 2.0
+retrospective_penalty: 0.015
+```
+
+These shape the planner's preferences:
+
+- **`reverse_penalty: 2.0`** — makes reversing twice as expensive as driving forward. With DUBIN mode, reversing is already impossible, but this provides a safety margin if the model is changed.
+- **`change_penalty: 0.0`** — no penalty for switching between turning and driving straight. Set this higher if you want the planner to prefer fewer steering changes.
+- **`non_straight_penalty: 1.2`** — turning costs 20% more than driving straight. This biases the planner toward straighter paths where possible, producing smoother motion.
+- **`cost_penalty: 2.0`** — doubles the weight of costmap cell values. High-cost cells near obstacles become strongly repulsive, pushing the path toward the center of free space.
+- **`retrospective_penalty: 0.015`** — a small penalty for deviating from the direction the planner came from. This discourages unnecessary zigzagging.
+
+<Callout type="see">The penalty values interact. If you increase <code>cost_penalty</code>, the planner avoids obstacles more aggressively but may produce longer, more winding paths. If you increase <code>non_straight_penalty</code>, paths become straighter but may pass closer to walls. Tuning is always a tradeoff between path length, smoothness, and obstacle clearance.</Callout>
+
+### Analytic expansion
+
+```yaml
+analytic_expansion_ratio: 3.5
+analytic_expansion_max_length: 3.0
+analytic_expansion_max_cost: 200.0
+analytic_expansion_max_cost_override: false
+```
+
+- **`analytic_expansion_ratio: 3.5`** — try a direct Dubins connection to the goal every 3.5x expected minimum expansions.
+- **`analytic_expansion_max_length: 3.0`** — the analytic path can be at most 3 meters long. Beyond that, the risk of cutting through unseen obstacles is too high.
+- **`analytic_expansion_max_cost: 200.0`** — reject analytic paths whose maximum costmap value exceeds 200 (out of 254). This prevents the shortcut from grazing obstacles.
+
+---
+
+## Where Does minimum_turning_radius Come From?
+
+The value 0.75 meters is not arbitrary. It comes from the vehicle's physical geometry.
+
+The school bus has a wheelbase (distance from front axle to rear axle) of **0.711 meters** and a maximum steering angle of approximately **43 degrees**. The minimum turning radius for an Ackermann vehicle is:
+
+```
+R = wheelbase / tan(max_steering_angle)
+R = 0.711 / tan(43°)
+R = 0.711 / 0.9325
+R ≈ 0.76 meters
+```
+
+This is rounded down to **0.75** in the configuration. The rounding is conservative — it tells the planner the robot can turn slightly tighter than it actually can. In practice this is fine because the path follower (M9) smooths out any sub-centimeter discrepancies.
+
+<Callout type="warning">If you change this value, change it in both the planner and the controller (M9). If the planner plans paths with a tighter turning radius than the controller can execute, the robot will cut corners, oscillate, or leave the planned path entirely. If the planner uses a larger radius than necessary, paths will be safe but inefficient — the robot will take wider turns than it needs to.</Callout>
+
+---
+
+## Path Smoothing
+
+The raw output of Hybrid A* consists of discrete poses connected by motion primitives. While kinematically feasible, the path can have slight discontinuities at the junctions between primitives. The built-in smoother refines the path after planning.
+
+### Built-in SmacPlanner smoother
+
+```yaml
+smooth_path: true
+smoother:
+  max_iterations: 1000
+  w_smooth: 0.3
+  w_data: 0.2
+  tolerance: 1.0e-10
+  do_refinement: true
+  refinement_num: 2
+```
+
+- **`w_smooth: 0.3`** — weight for path smoothness. Higher values produce smoother curves but may pull the path away from the original waypoints.
+- **`w_data: 0.2`** — weight for staying close to the original planned waypoints. Higher values keep the smoothed path closer to the raw plan.
+- **`do_refinement: true`** — runs a second pass of smoothing after the first.
+- **`refinement_num: 2`** — performs 2 refinement passes total, progressively smoothing the result.
+
+### Smoother server
+
+Nav2 also runs a separate smoother server that can post-process paths from any planner:
+
+```yaml
+smoother_server:
+  ros__parameters:
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
+```
+
+The smoother server is available if the behavior tree requests it, but in normal operation the SmacPlanner's built-in smoother handles path refinement before the path is published.
+
+---
+
+## Hands-on: Inspecting Paths
+
+### Reading a planned path
+
+After sending a Nav2 goal in RViz (click "2D Goal Pose"), the planner publishes the result on `/plan`:
+
+<CommandBlock command="ros2 topic echo /plan --once" description="Print one Nav2 path message" />
+
+<TerminalOutput title="Laptop -- /plan (truncated)">
+{`header:
+  stamp:
+    sec: 1777631200
+    nanosec: 185402112
+  frame_id: map
+poses:
+- header:
+    stamp:
+      sec: 0
+      nanosec: 0
+    frame_id: ''
+  pose:
+    position:
+      x: 1.225
+      y: 0.375
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0436
+      w: 0.9990
+- header:
+    stamp:
+      sec: 0
+      nanosec: 0
+    frame_id: ''
+  pose:
+    position:
+      x: 1.275
+      y: 0.381
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0654
+      w: 0.9979
+- header:
+    stamp:
+      sec: 0
+      nanosec: 0
+    frame_id: ''
+  pose:
+    position:
+      x: 1.324
+      y: 0.393
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0871
+      w: 0.9962
+...`}
+</TerminalOutput>
+
+Each pose in the path has:
+
+- **position (x, y)** — where the robot should be, in the `map` frame
+- **orientation (quaternion)** — which direction the robot should be facing at that point
+
+Notice that the orientation changes gradually between poses. This is the key difference from a grid planner — every waypoint includes a heading, and the heading transitions respect the turning radius.
+
+### Checking planner parameters at runtime
+
+You can query the live planner parameters without restarting anything:
+
+<CommandBlock command="ros2 param get /planner_server GridBased.minimum_turning_radius" description="Check the current minimum turning radius" />
+
+<TerminalOutput title="Laptop -- param get">
+{`Double value is: 0.75`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 param get /planner_server GridBased.motion_model_for_search" description="Check which motion model is active" />
+
+<TerminalOutput title="Laptop -- param get">
+{`String value is: DUBIN`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 param get /planner_server GridBased.angle_quantization_bins" description="Check heading resolution" />
+
+<TerminalOutput title="Laptop -- param get">
+{`Integer value is: 72`}
+</TerminalOutput>
+
+---
+
+## Failure Gallery
+
+### "No valid path found"
+
+<TerminalOutput title="Laptop -- planner failure">
+{`[planner_server]: No valid path found
+[bt_navigator]: Navigation failed with error code: 207`}
+</TerminalOutput>
+
+**Possible causes:**
+
+1. **Goal is inside an obstacle.** The costmap cell at the goal position has a cost of 254 (lethal). Move the goal to free space. In RViz, overlay the costmap and make sure the goal arrow lands on a low-cost cell.
+
+2. **Inflation radius too large.** If the inflation layer in M7 is set too aggressively, narrow doorways or gaps between furniture become fully inflated — no cell in the gap has a cost below lethal. Reduce `inflation_radius` or `cost_scaling_factor` in the costmap config.
+
+3. **Map not yet available.** If SLAM has not published a map yet (within the first 25 seconds of bringup), the planner has no costmap to search. Wait for SLAM to activate.
+
+4. **Max planning time exceeded.** In complex environments, 5 seconds may not be enough. Check if increasing `max_planning_time` resolves the issue. If it does, consider also increasing `max_iterations`.
+
+### Path has impossibly sharp corners
+
+**Symptom:** The path displayed in RViz has corners tighter than the robot can execute. The controller oscillates or overshoots at these turns.
+
+**Cause:** `minimum_turning_radius` is set too small. The planner is generating paths with arcs tighter than the physical vehicle can follow.
+
+**Fix:** Increase `minimum_turning_radius` in `nav2_params.yaml`. Recalculate it from the actual wheelbase and maximum steering angle using R = L / tan(alpha). After changing the parameter, rebuild or restart the planner server.
+
+### Path hugs walls
+
+**Symptom:** The planned path passes very close to walls or obstacles, leaving almost no clearance.
+
+**Cause:** `cost_penalty` is too low. The planner is not sufficiently repelled by high-cost cells near obstacles.
+
+**Fix:** Increase `cost_penalty` from 2.0 to 3.0 or 4.0. Alternatively, increase the inflation radius in the global costmap (M7) so that the high-cost zone around obstacles is wider.
+
+---
+
+## Try It
+
+### Level 1: Observe a planned path
+
+Send a Nav2 goal in RViz and echo the `/plan` topic. Count the number of poses in the path. Divide the straight-line distance to the goal by the number of poses — this gives you the approximate spacing between waypoints. On the school bus with the default config, poses are typically spaced 5 cm apart (matching the costmap resolution).
+
+<CommandBlock command="ros2 topic echo /plan --once | grep 'x:' | wc -l" description="Count the number of x-coordinates (one per pose) in the path" />
+
+<Callout type="see">For a goal 2 meters away in a straight line, you should see roughly 40 poses (2.0 / 0.05). If the path curves around an obstacle, there will be more poses because the actual path length is greater than the straight-line distance.</Callout>
+
+### Level 2: Compare motion models
+
+Temporarily switch the motion model from DUBIN to REEDS_SHEPP and observe the difference:
+
+<CommandBlock command="ros2 param set /planner_server GridBased.motion_model_for_search REEDS_SHEPP" description="Switch to Reeds-Shepp motion model (allows reversing)" />
+
+Send a goal that requires a U-turn in a tight space. With DUBIN, the planner must find a wide forward-only arc. With REEDS_SHEPP, it may plan a three-point turn with reverse segments.
+
+<Callout type="warning">Do not actually execute a REEDS_SHEPP path on the school bus. The controller does not support reversing and the control tower will not switch drive modes. This experiment is observation-only. Switch back to DUBIN when you are done: <code>ros2 param set /planner_server GridBased.motion_model_for_search DUBIN</code></Callout>
+
+### Level 3: Tune the turning radius
+
+Try planning the same path with different turning radii:
+
+<CommandBlock command="ros2 param set /planner_server GridBased.minimum_turning_radius 0.5" description="Set a tighter (possibly infeasible) turning radius" />
+
+Send a goal, observe the path in RViz, then try:
+
+<CommandBlock command="ros2 param set /planner_server GridBased.minimum_turning_radius 1.5" description="Set a wider (very conservative) turning radius" />
+
+Send the same goal again. Compare the two paths in RViz. The tighter radius produces shorter paths with sharper turns. The wider radius produces longer, sweeping paths that may not fit through narrow doorways at all.
+
+<Callout type="see">At 0.5m radius, the planner generates paths with turns tighter than the physical robot can execute (the real minimum is 0.76m). At 1.5m, paths are safe but wasteful — the robot takes unnecessarily wide arcs. The configured value of 0.75m is the sweet spot that matches the hardware. Reset it when done: <code>ros2 param set /planner_server GridBased.minimum_turning_radius 0.75</code></Callout>
+
+---
+
+**Next module:** [M9: Path Following](/modules/9-path-following) — The planner produces the path; the controller makes the robot follow it. Regulated Pure Pursuit converts the planned poses into steering and throttle commands.

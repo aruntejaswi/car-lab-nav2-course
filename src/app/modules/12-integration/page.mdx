@@ -1,0 +1,466 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M12: Integration
+
+Tracing every byte from sensor to wheel.
+
+---
+
+## Learning Objectives
+
+By the end of this module you will be able to:
+
+- Trace the complete data flow from Velodyne LiDAR to wheel motors
+- Execute the full multi-machine launch sequence from memory
+- Explain exactly what happens when you click a Nav2 goal in RViz2
+- Diagnose the five most common integration failures
+- Verify every layer of the stack with a single checklist
+
+**Prerequisites:** All previous modules (M0 through M11). This is the capstone — it assumes you understand each subsystem individually and focuses on how they connect.
+
+---
+
+## The Complete Data Flow
+
+Every module so far has focused on one node or one subsystem. Here is the full picture — every piece of data from physical sensor to physical wheel, with the ROS2 topic or TF transform that carries it.
+
+```
+Velodyne VLP-16 (192.168.0.201)
+  │  UDP packets over Ethernet
+  ▼
+velodyne_driver_node → velodyne_transform_node
+  │
+  │  /velodyne_points (PointCloud2, ~10 Hz)
+  ├──────────────────────────────────────────┐
+  ▼                                          ▼
+pointcloud_to_laserscan                   KISS-ICP
+  │                                          │
+  │  /velodyne_scan (LaserScan, ~10 Hz)      │  /kiss/odometry (Odometry, ~9.5 Hz)
+  │                                          │  TF: odom → base_footprint
+  ├──────────┬──────────┐                    ▼
+  │          │          │              robot_localization EKF
+  ▼          ▼          ▼                    ▲
+SLAM      global     local                  │
+Toolbox   costmap    costmap     IMU (LSM6DSOX)
+  │          │          │        imu_filter_madgwick
+  │          │          │          │  /imu/LSM6DSOX_filtered
+  │          │          │          │
+  │  /map    │          │          └──► EKF
+  │  TF: map → odom    │                │
+  ▼          ▼          ▼                │  /odometry/local (Odometry, ~15 Hz)
+  └──► SmacPlannerHybrid ◄───────────────┘
+            │
+            │  /plan (Path)
+            ▼
+     RegulatedPurePursuit
+            │
+            │  /cmd_vel (Twist)
+            ▼
+     velocity_smoother
+            │
+            │  /cmd_vel_smoothed (Twist)
+            ▼
+     collision_monitor
+            │
+            │  /cmd_vel_nav (Twist)
+            ▼
+     control_tower_ros2
+            │
+            │  MQTT over localhost
+            ▼
+     ESCs → 4 wheels (double Ackermann)
+```
+
+<Callout type="why">
+There are 14 nodes between the LiDAR firing a laser pulse and a wheel turning. Each one does exactly one job. If any node in the chain stops publishing, everything downstream goes blind. This is why integration testing matters — a single missing TF frame or stale DDS shared-memory file can silently break a node three layers away.
+</Callout>
+
+### The Three Parallel Streams
+
+The data flow is not a single chain. It splits into three parallel streams that converge at Nav2:
+
+**Stream 1 — Odometry:** The LiDAR point cloud feeds KISS-ICP, which produces an odometry estimate. The IMU provides orientation and angular velocity. The EKF fuses both into `/odometry/local`, the robot's best estimate of where it is relative to where it started. This stream produces the `odom` to `base_footprint` TF transform.
+
+**Stream 2 — Mapping:** The 2D laser scan feeds SLAM Toolbox, which matches incoming scans against the growing map. This stream produces the `/map` occupancy grid and the `map` to `odom` TF transform. Together with Stream 1, this gives the robot a position in the global map frame.
+
+**Stream 3 — Obstacle detection:** The same 2D laser scan feeds both the global and local costmaps. The global costmap uses it alongside the SLAM map to plan long-range paths. The local costmap uses it alone to react to obstacles that appeared after the path was planned.
+
+All three streams must be running and healthy for the robot to navigate. If Stream 1 fails, the robot does not know where it is. If Stream 2 fails, it has no map to plan on. If Stream 3 fails, it cannot see obstacles.
+
+---
+
+## The TF Tree in Full
+
+The TF tree is the skeleton that connects every sensor measurement to every other. Here it is, fully expanded:
+
+```
+map
+ └──(SLAM Toolbox)──► odom
+                        └──(KISS-ICP)──► base_footprint
+                                          ├──(URDF)──► base_link
+                                          │             ├──► front_left_wheel_link
+                                          │             ├──► front_right_wheel_link
+                                          │             ├──► rear_left_wheel_link
+                                          │             ├──► rear_right_wheel_link
+                                          │             ├──► camera_link
+                                          │             └──► ... (109 links total)
+                                          └──(URDF)──► 3d_lidar_link
+```
+
+Three transforms carry all the navigation information:
+
+| Transform | Published by | Meaning |
+|-----------|-------------|---------|
+| `map` to `odom` | SLAM Toolbox | Corrects accumulated odometry drift. Updated every time SLAM matches a scan. |
+| `odom` to `base_footprint` | KISS-ICP | The robot's estimated motion since startup. Updated at ~9.5 Hz. |
+| `base_footprint` to `3d_lidar_link` | robot_state_publisher | A static transform from the URDF. Never changes. Tells every node where the LiDAR is mounted. |
+
+<Callout type="warning">
+If `robot_state_publisher` is not running on the Pi, the `base_footprint` to `3d_lidar_link` transform does not exist. KISS-ICP cannot convert LiDAR points into the robot frame, so it publishes nothing. SLAM Toolbox receives scans but cannot place them in the map. The entire stack silently fails. This is the single most common integration failure.
+</Callout>
+
+---
+
+## Full Launch Sequence
+
+This is the complete startup procedure for the two-machine system. The Pi runs sensors and motors. The Laptop runs odometry, SLAM, and Nav2.
+
+### Step 1: Preflight (from your dev machine)
+
+<CommandBlock command="./scripts/preflight.sh --fix" description="Clean stale DDS shared memory, validate network connectivity to Pi, Laptop, and Velodyne" />
+
+<TerminalOutput title="Dev machine — preflight">
+{`[OK] Pi (192.168.0.3) reachable
+[OK] Laptop (192.168.0.22) reachable
+[OK] Velodyne (192.168.0.201) reachable
+[OK] Cleaned 3 stale /dev/shm/fastrtps_* files on Laptop
+[OK] ROS_DOMAIN_ID=99 set on both machines
+[OK] Chrony NTP offset: 0.004s (under 50ms threshold)
+Preflight passed.`}
+</TerminalOutput>
+
+### Step 2: Start Pi services (requires sudo)
+
+<CommandBlock command="ssh pi@192.168.0.3 'sudo systemctl start ractor-sensors.service ractor-controls.service'" description="Start LiDAR, IMU, motor control, and MQTT bridge on the Pi" />
+
+Wait 5 seconds for the Velodyne to begin streaming UDP packets. You can verify:
+
+<CommandBlock command="ssh pi@192.168.0.3 'source /opt/ros/jazzy/setup.bash && source ~/sensor_ws/install/setup.bash && ros2 topic hz /velodyne_points --window 5'" description="Verify LiDAR is publishing on the Pi" />
+
+### Step 3: Launch robot_state_publisher on Pi
+
+Open a new terminal and SSH to the Pi:
+
+<CommandBlock command="ssh pi@192.168.0.3" description="SSH to the Raspberry Pi" />
+
+Then source and launch:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/sensor_ws/install/setup.bash
+source ~/ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=99
+ros2 launch schoolbus_urdf schoolbus.launch.py
+```
+
+<TerminalOutput title="Pi — robot_state_publisher">
+{`[INFO] [launch]: All log files can be found below /home/pi/.ros/log/...
+[INFO] [robot_state_publisher-1]: process started with pid [4821]
+[robot_state_publisher-1] [INFO] [1777544801.112]: got segment base_footprint
+[robot_state_publisher-1] [INFO] [1777544801.113]: got segment 3d_lidar_link
+[robot_state_publisher-1] [INFO] [1777544801.114]: got segment base_link
+...
+[robot_state_publisher-1] [INFO] [1777544801.203]: got segment front_right_wheel_link`}
+</TerminalOutput>
+
+This publishes the static TF tree (109 links) from the URDF. Leave this terminal running.
+
+### Step 4: Launch bringup on Laptop
+
+Open a new terminal and SSH to the Laptop:
+
+<CommandBlock command="ssh dev@192.168.0.22" description="SSH to the navigation Laptop" />
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=99
+ros2 launch nav2_schoolbus bringup_launch.py slam:=True use_localization:=True
+```
+
+<TerminalOutput title="Laptop — bringup_launch.py">
+{`[INFO] [launch]: All log files can be found below /home/dev/.ros/log/...
+[INFO] [pointcloud_to_laserscan-1]: process started with pid [18442]
+[INFO] [kiss_icp_node-2]: process started with pid [18443]
+[INFO] [ekf_node-3]: process started with pid [18444]
+[INFO] [async_slam_toolbox_node-4]: process started with pid [18445]
+[kiss_icp_node-2] [INFO]: KISS-ICP initialized. Waiting for PointCloud2...
+[ekf_node-3] [INFO]: Waiting for data on /kiss/odometry...
+[async_slam_toolbox_node-4] [INFO]: Waiting for scan data on /velodyne_scan...`}
+</TerminalOutput>
+
+### Step 5: Wait for Nav2 activation (~35 seconds)
+
+The 25-second `TimerAction` in `bringup_launch.py` delays Nav2 startup so SLAM Toolbox has time to publish the `map` to `odom` transform. After the timer fires, Nav2 lifecycle nodes transition from "inactive" to "active" over the next ~10 seconds.
+
+<TerminalOutput title="Laptop — Nav2 activation (after ~25s)">
+{`[INFO] [lifecycle_manager-5]: Configuring bt_navigator
+[INFO] [lifecycle_manager-5]: Configuring controller_server
+[INFO] [lifecycle_manager-5]: Configuring planner_server
+[INFO] [lifecycle_manager-5]: Configuring velocity_smoother
+[INFO] [lifecycle_manager-5]: Configuring collision_monitor
+...
+[INFO] [lifecycle_manager-5]: Activating bt_navigator
+[INFO] [lifecycle_manager-5]: Managed nodes are active`}
+</TerminalOutput>
+
+### Step 6: Open RViz2
+
+On the Laptop (or any machine on the same network with `ROS_DOMAIN_ID=99`):
+
+<CommandBlock command="rviz2" description="Open RViz2 for visualization and goal setting" />
+
+Set **Fixed Frame** to `map` in the top-left dropdown. Add displays for `/map` (Map), `/velodyne_scan` (LaserScan), `/plan` (Path), and the robot model.
+
+### Step 7: Enable autonomous mode
+
+Flip **Switch B** on the RC transmitter to the auto position. This sets CH8 to 2000, telling `control_tower_ros2` to accept `/cmd_vel_nav` commands instead of RC joystick input.
+
+<Callout type="warning">
+Never publish fake RC channel values from the command line. The auto/teleop switch must be changed on the physical joystick. If something goes wrong, flip Switch B back to teleop or flip Switch D (CH6) to e-stop position (1000) to cut motor power immediately.
+</Callout>
+
+### Step 8: Send a Nav2 goal
+
+In RViz2, click the **Nav2 Goal** button in the toolbar, then click and drag on the map to set a goal position and heading. The robot will plan a path and begin following it.
+
+---
+
+## "I Click a Goal in RViz2 — What Happens?"
+
+This is the question this entire course has been building toward. Here is every step, in order, from mouse click to wheel rotation.
+
+### 1. RViz2 publishes the goal
+
+When you click and drag on the map, RViz2 publishes a `geometry_msgs/PoseStamped` message to `/goal_pose`. The message contains an (x, y) position and a quaternion orientation in the `map` frame.
+
+### 2. bt_navigator receives the goal
+
+The `bt_navigator` node subscribes to `/goal_pose`. When a goal arrives, it loads the behavior tree XML (NavigateWithReplanning) and begins executing it. The behavior tree is a decision tree that orchestrates planning and following.
+
+### 3. BT calls ComputePathToPose
+
+The behavior tree's first action node sends a request to the `planner_server`. The planner server queries the **global costmap** — a grid built from the SLAM map plus live laser scan data — and runs **SmacPlannerHybrid**.
+
+SmacPlannerHybrid uses Hybrid A* search with Dubins curves. It respects the robot's minimum turning radius (0.35 m) and never plans a path that requires rotating in place (which this Ackermann-steered robot cannot do through Nav2). The result is a `nav_msgs/Path` published on `/plan`.
+
+### 4. BT calls FollowPath
+
+The behavior tree passes the planned path to the `controller_server`, which runs **RegulatedPurePursuit** (RPP). RPP picks a "lookahead point" on the path some distance ahead of the robot and computes the steering angle needed to reach it. It publishes a `geometry_msgs/Twist` on `/cmd_vel` at 20 Hz.
+
+### 5. velocity_smoother limits acceleration
+
+The raw `/cmd_vel` from RPP could have sharp jumps in velocity. The `velocity_smoother` node applies acceleration limits to produce a gentler `/cmd_vel_smoothed`, preventing wheel slip and mechanical stress.
+
+### 6. collision_monitor checks for obstacles
+
+The `collision_monitor` node subscribes to `/cmd_vel_smoothed` and the laser scan. It projects the robot's path forward and checks for obstacles. If an obstacle is detected in the robot's immediate path, it reduces or zeroes the velocity. The safe output is published as `/cmd_vel_nav`.
+
+### 7. control_tower converts Twist to wheel commands
+
+The `control_tower_ros2` node receives `/cmd_vel_nav`. It uses the double-Ackermann kinematic model to compute individual steering angles and wheel velocities for all four wheels. The robot has four-wheel steering — both front and rear axles turn.
+
+### 8. MQTT sends to ESCs
+
+The control tower publishes the per-wheel commands over MQTT on localhost. The MQTT bridge forwards them to the four electronic speed controllers (ESCs), which drive the motors. The wheels turn. The robot moves.
+
+### 9. The loop closes
+
+As the robot moves, the LiDAR sees a new scene. KISS-ICP matches the new point cloud against the previous one and updates the odometry. SLAM Toolbox matches the new laser scan against the map. The costmaps update. RPP computes a new `/cmd_vel` based on the updated position. This entire loop runs continuously at approximately 10 Hz.
+
+<Callout type="see">
+From mouse click to wheel motion, the latency is approximately 200-300 ms. The path planning itself takes 50-150 ms for a typical indoor environment. The rest is the controller computing the first velocity command and it propagating through the smoother and collision monitor.
+</Callout>
+
+---
+
+## Verification Checklist
+
+Before sending a Nav2 goal, verify every layer of the stack is healthy. Run these commands from any machine with `ROS_DOMAIN_ID=99`:
+
+### Sensor layer
+
+<CommandBlock command="ros2 topic hz /velodyne_points" description="Verify LiDAR point cloud (expect ~10 Hz)" />
+
+<TerminalOutput title="Laptop — sensor check">
+{`average rate: 9.921
+	min: 0.098s max: 0.103s std dev: 0.00108s window: 50`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 topic hz /velodyne_scan" description="Verify 2D laser scan (expect ~10 Hz)" />
+
+### Odometry layer
+
+<CommandBlock command="ros2 topic hz /kiss/odometry" description="Verify KISS-ICP odometry (expect ~9.5 Hz)" />
+
+<TerminalOutput title="Laptop — odometry check">
+{`average rate: 9.487
+	min: 0.102s max: 0.110s std dev: 0.00213s window: 50`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 topic hz /odometry/local" description="Verify EKF fused odometry (expect ~15 Hz)" />
+
+<TerminalOutput title="Laptop — EKF check">
+{`average rate: 15.02
+	min: 0.064s max: 0.069s std dev: 0.00142s window: 50`}
+</TerminalOutput>
+
+### SLAM layer
+
+<CommandBlock command="ros2 topic hz /map" description="Verify SLAM map updates (periodic, not continuous)" />
+
+<CommandBlock command="ros2 run tf2_ros tf2_echo map odom" description="Verify SLAM is publishing the map-to-odom transform" />
+
+<TerminalOutput title="Laptop — TF check">
+{`At time 1777544912.445
+- Translation: [0.032, -0.018, 0.000]
+- Rotation: in Quaternion [0.000, 0.000, 0.003, 1.000]
+  in RPY (radian) [0.000, 0.000, 0.006]
+  in RPY (degree) [0.000, 0.000, 0.341]`}
+</TerminalOutput>
+
+<Callout type="see">
+The translation between `map` and `odom` represents SLAM's accumulated drift correction. Early in a session this will be near zero. After driving around and revisiting areas, SLAM will have applied loop closures and the offset may grow. This is normal — it means SLAM is doing its job.
+</Callout>
+
+### Nav2 layer
+
+<CommandBlock command="ros2 lifecycle get /bt_navigator" description="Verify Nav2 behavior tree navigator is active" />
+
+<TerminalOutput title="Laptop — lifecycle check">
+{`bt_navigator [active]`}
+</TerminalOutput>
+
+<CommandBlock command="ros2 lifecycle get /controller_server" description="Verify Nav2 controller server is active" />
+
+<CommandBlock command="ros2 lifecycle get /planner_server" description="Verify Nav2 planner server is active" />
+
+If any lifecycle node shows "inactive" or "unconfigured", Nav2 activation failed. See Exercise 4 below.
+
+---
+
+## Debugging Exercises
+
+These exercises are drawn from real failures encountered during development. Each describes a symptom you would see, the root cause, and how to fix it.
+
+### Exercise 1: "Invalid frame ID" from KISS-ICP
+
+**Symptom:** KISS-ICP logs repeat this warning every 100 ms:
+
+<TerminalOutput title="Laptop — KISS-ICP error">
+{`[kiss_icp_node-2] [WARN] [1777544810.223]: Could not transform point cloud
+from frame '3d_lidar_link' to 'base_footprint': "3d_lidar_link" passed to
+lookupTransform argument target_frame does not exist.`}
+</TerminalOutput>
+
+**Root cause:** `robot_state_publisher` is not running on the Pi. The URDF defines the `3d_lidar_link` frame and its relationship to `base_footprint`. Without it, the TF tree has no knowledge of where the LiDAR is mounted.
+
+**Fix:** Launch `robot_state_publisher` on the Pi (Step 3 of the launch sequence). Within 1-2 seconds, KISS-ICP will find the transform and begin publishing odometry.
+
+### Exercise 2: Map is jumping or unstable
+
+**Symptom:** In RViz2, the map flickers or jumps between two positions. The robot's position on the map oscillates rapidly. SLAM Toolbox may log scan matching failures.
+
+**Root cause:** Stale DDS shared-memory files in `/dev/shm/`. When a previous ROS2 session crashed or was killed without cleanup, it leaves behind `fastrtps_*` files. New sessions may partially read old data, causing topic corruption — especially on large messages like maps and point clouds.
+
+**Fix:** Stop all ROS2 processes on the Laptop, then run preflight:
+
+<CommandBlock command="./scripts/preflight.sh --fix" description="Clean stale DDS shared memory and restart" />
+
+Then relaunch from Step 4. Do not clean DDS on the Pi while `ractor-sensors.service` is running — it will kill the service's DDS context silently. If the Pi is affected, restart the service instead:
+
+<CommandBlock command="ssh pi@192.168.0.3 'sudo systemctl restart ractor-sensors.service'" description="Restart Pi sensor service (also cleans its DDS context)" />
+
+### Exercise 3: Robot plans a path but does not move
+
+**Symptom:** RViz2 shows a valid green path from the robot to the goal. The controller is computing `/cmd_vel` (you can see it with `ros2 topic echo /cmd_vel`). But the wheels do not turn.
+
+**Root cause:** The RC transmitter's Switch B (CH8) is not in auto position (2000). The control tower node only forwards `/cmd_vel_nav` to the motors when CH8 = 2000. Alternatively, Switch D (CH6) may be in e-stop position (1000), which cuts all motor output.
+
+**Fix:** Flip Switch B to auto on the physical RC transmitter. Verify CH8:
+
+<CommandBlock command="ros2 topic echo /control/ch8 --once" description="Check current auto/teleop state" />
+
+<TerminalOutput title="Laptop — CH8 check">
+{`data: 2000`}
+</TerminalOutput>
+
+A value of 1000 means teleop mode. A value of 2000 means auto. If CH6 shows 1000, flip Switch D to disable e-stop.
+
+### Exercise 4: Nav2 lifecycle never activates
+
+**Symptom:** After launching `bringup_launch.py`, the log never shows "Managed nodes are active." Running `ros2 lifecycle get /bt_navigator` returns "unconfigured" or "inactive."
+
+**Root cause:** SLAM Toolbox is not publishing the `map` to `odom` transform. The Nav2 lifecycle manager waits for valid TF before activating. If SLAM never receives scan data, or never computes an initial match, the transform never appears.
+
+**Diagnosis chain:**
+
+1. Is `/velodyne_scan` publishing? If no, check the LiDAR pipeline (Exercise 1).
+2. Is SLAM Toolbox in the "active" lifecycle state? Check with `ros2 lifecycle get /slam_toolbox`.
+3. Does the `map` to `odom` TF exist? Check with `ros2 run tf2_ros tf2_echo map odom`.
+
+**Fix:** If scans are arriving but SLAM is stuck, the most likely cause is that the 25-second timer fired before SLAM was ready. Increase the `period` value in `bringup_launch.py`'s `TimerAction` from 25.0 to 35.0, rebuild, and relaunch.
+
+### Exercise 5: Path planned but controller oscillates or fails
+
+**Symptom:** The planner generates a valid path, but the controller logs warnings about being unable to follow it. The robot may oscillate, overshoot turns, or stop mid-path with a "controller failed" error.
+
+**Root cause:** The planned path passes through a region that became inflated in the local costmap after the path was computed. The local costmap updates continuously from live laser scan data — a person walking nearby, a door closing, or even the robot's own motion revealing new obstacles can all change the costmap after planning.
+
+**Fix:** This is handled automatically by the behavior tree. The NavigateWithReplanning tree calls ComputePathToPose on a timer (every 1 second by default), so the path is replanned around new obstacles. If the controller still fails, the BT triggers a recovery behavior (wait, clear costmaps, replan). If the robot is genuinely stuck with no valid path, the navigation will abort and RViz2 will show a red marker at the goal.
+
+<Callout type="why">
+These five exercises cover the most common integration failures in order of how often they occur during real development sessions. Exercise 1 (missing TF) happens almost every session where someone forgets a launch step. Exercise 2 (DDS corruption) happens after crashes. Exercises 3-5 happen during normal operation. If you can diagnose all five from memory, you can troubleshoot most Nav2 integration issues on this robot.
+</Callout>
+
+---
+
+## Network Topology
+
+The robot runs on a dedicated wired network. Every device has a static IP:
+
+| Device | IP Address | Role |
+|--------|-----------|------|
+| Raspberry Pi | 192.168.0.3 | Sensors (Velodyne driver, IMU), motor control, URDF TF |
+| Laptop | 192.168.0.22 | KISS-ICP, EKF, SLAM Toolbox, Nav2, RViz2 |
+| Velodyne VLP-16 | 192.168.0.201 | Streams raw LiDAR data over UDP |
+
+All ROS2 nodes use `ROS_DOMAIN_ID=99` to isolate the robot's traffic from any other ROS2 systems on the network. DDS discovery happens over multicast — the Pi and Laptop find each other automatically as long as they are on the same subnet and domain ID.
+
+Time synchronization between the Pi and Laptop is handled by Chrony. The Laptop serves NTP to the Pi. This keeps timestamps aligned to within a few milliseconds, which is critical for TF lookups and sensor fusion.
+
+---
+
+## What's Next
+
+The navigation stack works end-to-end for indoor environments. Here are the areas where future development can extend it:
+
+**Drive mode switcher node.** The robot can physically rotate in place — the control tower has a "rotate" drive mode activated by CH7 on the RC transmitter. But Nav2 cannot trigger this mode switch. A future node could watch `/cmd_vel` and automatically switch between ackermann and rotate modes based on whether the commanded motion is pure rotation or forward driving. This would let Nav2 orient the robot at goals without the current `yaw_goal_tolerance: 3.14` workaround.
+
+**Wheel encoder odometry.** The robot currently has no wheel encoders. Adding encoders would provide a second odometry source that the EKF could fuse with KISS-ICP. Wheel encoders work when the LiDAR cannot — in featureless environments like long empty hallways where ICP scan matching degrades.
+
+**Outdoor GPS integration.** The robot has a GPS module that is not yet integrated into the navigation stack. For outdoor navigation, GPS could provide a global position fix that bounds odometry drift over long distances. The `robot_localization` EKF already supports GPS inputs via its `navsat_transform` node.
+
+**Multi-floor mapping.** SLAM Toolbox produces 2D maps. For a building with multiple floors, the system would need a map-switching mechanism — either separate maps per floor with a floor-detection trigger, or a full 3D SLAM solution.
+
+---
+
+## Summary
+
+This module tied together every subsystem covered in M0 through M11. The school bus navigation stack is 14 nodes connected by topics and TF transforms across two machines. Three parallel data streams — odometry, mapping, and obstacle detection — converge at Nav2, which plans paths and commands the wheels.
+
+The most important takeaway: **every layer depends on the layers below it.** If the LiDAR stops, odometry stops, SLAM stops, costmaps go blind, and Nav2 cannot navigate. If robot_state_publisher is missing, the TF tree is broken and half the nodes cannot function. Integration debugging is almost always about finding which layer broke and why.
+
+You now have the knowledge to start the robot from a cold boot, verify every layer, send autonomous navigation goals, and diagnose the most common failures. The rest is practice.

@@ -1,0 +1,305 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+
+# M1: LiDAR
+
+Seeing the world in 3D point clouds.
+
+---
+
+## Learning Objectives
+
+By the end of this module you will be able to:
+
+- Explain how a spinning time-of-flight LiDAR measures distances
+- Read and interpret a ROS2 `PointCloud2` message
+- Understand why the 3D point cloud is sliced into a 2D `LaserScan` for SLAM
+
+---
+
+## Physics: Time-of-Flight LiDAR
+
+A time-of-flight LiDAR measures distance by firing a laser pulse and timing how long the reflection takes to return. Light travels at ~300,000 km/s, so a pulse that returns in 10 nanoseconds hit something 1.5 meters away (distance = speed x time / 2, because the light travels there and back).
+
+<figure className="my-8">
+  <img src="/images/velodyne-closeup.jpg" alt="Velodyne VLP-16 LiDAR mounted on the school bus robot" className="rounded-lg border border-zinc-200 dark:border-zinc-700 max-w-md mx-auto" />
+  <figcaption className="text-sm text-zinc-500 mt-2 text-center">The Velodyne VLP-16 on its purple 3D-printed mount. The silver puck contains 16 laser/detector pairs and a motor that spins the assembly 360 degrees.</figcaption>
+</figure>
+
+### How the VLP-16 Works
+
+The Velodyne VLP-16 stacks **16 laser beams** in a vertical fan, spaced 2 degrees apart, covering 30 degrees of vertical field of view (-15 to +15 degrees). A motor spins the entire fan assembly 360 degrees at **10 revolutions per second**.
+
+Each revolution, the sensor fires **1,822 firing sequences**. Each firing sequence triggers all 16 beams simultaneously. That produces:
+
+> 1,822 firing sequences x 16 beams = **29,152 distance measurements per revolution**
+
+The result is a 3D point cloud — a set of (x, y, z) coordinates — that refreshes 10 times per second. Every point represents a surface the laser bounced off: a wall, the floor, a chair leg, a person's shin.
+
+<Callout type="why">
+  Time-of-flight LiDAR works in complete darkness, is not confused by textures or colors, and gives millimeter-precision distance measurements. Cameras struggle with blank walls, glass, and lighting changes. This is why the LiDAR is the primary sensor for the robot's odometry, SLAM, costmaps, and collision avoidance.
+</Callout>
+
+---
+
+## Driver Pipeline
+
+The Velodyne LiDAR is a network device. It has its own IP address (192.168.0.201) and streams raw measurement data as UDP packets over Ethernet to the Raspberry Pi.
+
+Two ROS2 nodes on the Pi turn those UDP packets into usable data:
+
+```
+Velodyne hardware (192.168.0.201)
+  │
+  │  raw UDP packets over Ethernet
+  ▼
+velodyne_driver_node
+  │
+  │  /velodyne_packets (velodyne_msgs/VelodyneScan)
+  ▼
+velodyne_transform_node
+  │
+  │  /velodyne_points (sensor_msgs/PointCloud2)
+  ▼
+Available to all nodes on the ROS2 network
+```
+
+- **`velodyne_driver_node`** listens on the network for UDP packets from the LiDAR and publishes them as `/velodyne_packets`. These are still raw — firing times, rotation angles, and return intensities encoded in the Velodyne's proprietary format.
+
+- **`velodyne_transform_node`** decodes the raw packets, applies calibration data for each of the 16 beams, and computes (x, y, z) coordinates for every return. It publishes the result as `/velodyne_points`, a standard `sensor_msgs/PointCloud2` message.
+
+### Key details
+
+| Property | Value |
+|----------|-------|
+| Frame ID | `3d_lidar_link` |
+| Mount position | (0.178, 0.0, 0.938) m from `base_footprint` |
+| Publish rate | ~9.9 Hz |
+| QoS | RELIABLE, VOLATILE |
+| Points per scan | ~29,152 |
+
+Both driver nodes are managed by `ractor-sensors.service` on the Pi. They start automatically when the service is started — you should never launch them manually.
+
+---
+
+## Hands-on: Reading PointCloud2 Messages
+
+Let's look at what the LiDAR actually publishes. Use `ros2 topic echo` with `--once` to capture a single message:
+
+<CommandBlock command="ros2 topic echo /velodyne_points --once" description="Print one PointCloud2 message from the LiDAR" />
+
+<TerminalOutput title="Laptop — /velodyne_points (one message)">
+{`header:
+  stamp:
+    sec: 1777544844
+    nanosec: 322304256
+  frame_id: 3d_lidar_link
+height: 1822
+width: 16
+fields:
+- name: x
+  offset: 0
+  datatype: 7
+  count: 1
+- name: y
+  offset: 4
+  datatype: 7
+  count: 1
+- name: z
+  offset: 8
+  datatype: 7
+  count: 1
+- name: intensity
+  offset: 12
+  datatype: 7
+  count: 1
+- name: ring
+  offset: 16
+  datatype: 4
+  count: 1
+...`}
+</TerminalOutput>
+
+### Breaking this down
+
+**Header:** Every ROS2 message has a timestamp (`stamp`) and a coordinate frame (`frame_id`). The frame `3d_lidar_link` means all the (x, y, z) coordinates in this message are relative to the LiDAR's physical position on the robot. Module M3 (TF) explains how frames connect to each other.
+
+**height and width:** These describe the shape of the point array. `height: 1822` is the number of firing sequences per revolution. `width: 16` is the number of laser beams. Total points: 1822 x 16 = **29,152**.
+
+**fields:** Each point in the cloud carries five values:
+
+| Field | Datatype | Meaning |
+|-------|----------|---------|
+| `x` | 7 (FLOAT32) | Forward distance in meters |
+| `y` | 7 (FLOAT32) | Left/right distance in meters |
+| `z` | 7 (FLOAT32) | Up/down distance in meters |
+| `intensity` | 7 (FLOAT32) | Reflectivity of the surface (0-255). Metal and retroreflective tape return high values; dark fabric returns low values. |
+| `ring` | 4 (UINT16) | Which of the 16 laser beams (0-15) generated this point. Ring 0 is the lowest beam (-15 degrees), ring 15 is the highest (+15 degrees). |
+
+<Callout type="see">
+  The <code>datatype</code> numbers come from the <code>sensor_msgs/PointField</code> message definition. You don't need to memorize them, but the two you'll see here are: 7 = FLOAT32 (4-byte floating point) and 4 = UINT16 (2-byte unsigned integer).
+</Callout>
+
+### Checking the publish rate
+
+<CommandBlock command="ros2 topic hz /velodyne_points" description="Verify LiDAR is publishing at the expected rate" />
+
+<TerminalOutput title="Laptop — topic hz">
+{`average rate: 9.913
+	min: 0.099s max: 0.102s std dev: 0.00094s window: 50`}
+</TerminalOutput>
+
+The LiDAR spins at 10 Hz, so you should see a rate close to 10. If you see 0 Hz, the LiDAR is not publishing — jump to the Failure section below.
+
+---
+
+## pointcloud_to_laserscan: 3D to 2D
+
+The Velodyne produces a 3D point cloud with ~29,000 points spread across 30 degrees of vertical field of view. But SLAM Toolbox — the node that builds the map — expects a 2D `LaserScan`: a single ring of distance measurements in a flat plane, like a top-down radar sweep.
+
+The `pointcloud_to_laserscan` node bridges this gap. It takes a horizontal slice through the 3D point cloud and collapses it into a flat scan.
+
+```
+Side view of point cloud:           After slicing:
+
+    . . . . . .   (+15°)
+   . . . . . . .                    Only points in the
+  . . . . . . . .                   shaded band survive
+ ══════════════════  ← max_height (0.20m above LiDAR)
+ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ← LiDAR plane     → /velodyne_scan
+ ══════════════════  ← min_height (0.05m below LiDAR)
+  . . . . . . . .
+   . . . . . . .
+    . . . . . .    (-15°)
+```
+
+### Configuration
+
+These parameters are set in `bringup_launch.py`:
+
+| Parameter | Value | Physical meaning |
+|-----------|-------|------------------|
+| `min_height` | -0.05 m | 5 cm below the LiDAR plane. Catches slightly-below-level surfaces. |
+| `max_height` | 0.20 m | 20 cm above the LiDAR plane. Catches walls and obstacles at chest height. |
+| `range_min` | 0.45 m | Ignores returns closer than 45 cm. Filters out the robot's own frame and mounting structure. |
+| `range_max` | 10.0 m | Ignores returns beyond 10 m. Appropriate for indoor environments. |
+| `target_frame` | `3d_lidar_link` | Express all ranges in the LiDAR's coordinate frame. |
+
+<Callout type="why">
+  The <code>range_min: 0.45</code> parameter exists because the LiDAR can see parts of the robot itself — the purple mount, the frame rails, cable ties. Without this cutoff, SLAM Toolbox would see permanent "obstacles" right next to the sensor and build a map with phantom walls around the robot's own body.
+</Callout>
+
+### Output: LaserScan
+
+The output topic is `/velodyne_scan`, a `sensor_msgs/LaserScan` message:
+
+<CommandBlock command="ros2 topic echo /velodyne_scan --once" description="Print one LaserScan message" />
+
+<TerminalOutput title="Laptop — /velodyne_scan (one message, truncated)">
+{`header:
+  stamp:
+    sec: 1777544844
+    nanosec: 322304256
+  frame_id: 3d_lidar_link
+angle_min: -3.1416
+angle_max: 3.1416
+angle_increment: 0.01745
+range_min: 0.45
+range_max: 10.0
+ranges: [1.894, 1.902, 1.911, 1.923, 1.938, ...]`}
+</TerminalOutput>
+
+Breaking this down:
+
+- **`angle_min` / `angle_max`:** -pi to +pi radians — full 360-degree coverage
+- **`angle_increment`:** 0.01745 radians = 1 degree. So there are 360 rays in the scan.
+- **`range_min` / `range_max`:** 0.45 m to 10.0 m — matches the parameters above
+- **`ranges`:** An array of 360 distance values, one per degree. Each value is the closest obstacle at that angle. Values of `inf` mean nothing was detected in range.
+
+<Callout type="see">
+  The LaserScan is dramatically simpler than the PointCloud2. Instead of ~29,000 (x,y,z) points in 3D space, you get 360 distance values in a flat plane. SLAM Toolbox can process this in a few milliseconds to match against the existing map.
+</Callout>
+
+---
+
+## Where the LiDAR Data Goes
+
+<Callout type="why">
+  The LiDAR is the primary sensor for this robot. Its data feeds four downstream systems, and if the LiDAR stops publishing, all four go blind simultaneously:
+
+  - **KISS-ICP (odometry)** — matches consecutive 3D point clouds to estimate how the robot moved. No clouds, no odometry.
+  - **SLAM Toolbox (mapping)** — uses the 2D laser scan to build and update the map. No scan, no map.
+  - **Costmaps (obstacle detection)** — marks cells in the navigation grid as occupied based on laser returns. No scan, no obstacle awareness.
+  - **Collision monitor (safety)** — uses the scan to emergency-stop if an obstacle appears in the robot's path. No scan, no collision avoidance.
+</Callout>
+
+---
+
+## Failure: No LiDAR Data
+
+**Symptom:** `ros2 topic hz /velodyne_points` shows 0 Hz, or the topic doesn't appear in `ros2 topic list` at all.
+
+<CommandBlock command="ros2 topic hz /velodyne_points" description="Check if the LiDAR is publishing" />
+
+**Possible causes, in order of likelihood:**
+
+1. **ractor-sensors.service not started.** After a power cycle, the systemd services on the Pi don't auto-start. Run `sudo systemctl start ractor-sensors.service` on the Pi.
+
+2. **Velodyne not powered.** The LiDAR draws significant power. Check that the relay board on the Pi is energized and the LiDAR's motor is spinning (you can hear it).
+
+3. **Network cable unplugged.** The Velodyne sends UDP packets over Ethernet. If the cable between the LiDAR and the Pi is loose, no packets arrive. Try `ping 192.168.0.201` from the Pi.
+
+4. **Duplicate drivers running.** This is a subtle and dangerous one.
+
+<Callout type="warning">
+  If you manually launch the Velodyne driver while <code>ractor-sensors.service</code> is already running, you end up with two <code>velodyne_driver_node</code> instances both listening on the same UDP port. They corrupt each other's data — you'll see garbled point clouds, missing sectors, or the topic flickering between two different rates. Never launch the Velodyne driver manually. Always use the systemd service.
+</Callout>
+
+### Diagnosis steps
+
+<CommandBlock command="ssh pi@192.168.0.3 'sudo systemctl status ractor-sensors.service'" description="Check if the sensor service is running on the Pi" />
+
+<CommandBlock command="ssh pi@192.168.0.3 'ping -c 3 192.168.0.201'" description="Check network connectivity to the Velodyne" />
+
+<CommandBlock command="ros2 node list | grep velodyne" description="Check how many Velodyne nodes are running (should be exactly 2)" />
+
+---
+
+## Try It
+
+### Level 1: Observe
+
+Echo one `PointCloud2` message from `/velodyne_points`. Look at the `height` and `width` fields. How many total points are in one scan?
+
+<CommandBlock command="ros2 topic echo /velodyne_points --once" description="Capture one point cloud message" />
+
+<Callout type="see">
+  height x width = 1822 x 16 = <strong>29,152 points</strong> per scan. That's ~29,000 distance measurements refreshed 10 times per second.
+</Callout>
+
+### Level 2: Experiment
+
+Change the `max_height` parameter on the `pointcloud_to_laserscan` node from its default of 0.20 m to 1.0 m:
+
+<CommandBlock command="ros2 param set /pointcloud_to_laserscan max_height 1.0" description="Widen the height slice to 1 meter above the LiDAR" />
+
+Watch the `/velodyne_scan` in RViz2. What changes?
+
+<Callout type="see">
+  With <code>max_height: 1.0</code>, the slice captures points much higher above the LiDAR plane. Furniture tops, shelving, doorframe headers, and other objects above the normal slice height now appear as obstacles in the scan. The scan becomes denser but also noisier — SLAM might struggle to match scans because the environment looks different at different heights.
+</Callout>
+
+### Level 3: Break It (Safely)
+
+Set `range_min` to 0.0 instead of 0.45:
+
+<CommandBlock command="ros2 param set /pointcloud_to_laserscan range_min 0.0" description="Remove the minimum range filter" />
+
+<Callout type="see">
+  With <code>range_min: 0.0</code>, the scan includes returns from the robot's own structure — the frame, the purple LiDAR mount, cable ties, anything within 45 cm. These appear as permanent obstacles right next to the sensor. If SLAM is running, it will try to incorporate these phantom obstacles into the map, creating ghost walls around the robot's position. Reset to 0.45 when you're done experimenting.
+</Callout>
+
+---
+
+**Next modules:** [M2: IMU](/modules/2-imu) -- measuring rotation and acceleration, or [M3: TF](/modules/3-tf) -- how the robot knows where each sensor is in space. Both are independent next steps.
