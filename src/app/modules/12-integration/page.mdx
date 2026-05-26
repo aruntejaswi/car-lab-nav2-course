@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M12: Integration
 
@@ -12,9 +13,9 @@ Tracing every byte from sensor to wheel.
 
 By the end of this module you will be able to:
 
-- Trace the complete data flow from Velodyne LiDAR to wheel motors
+- Trace the complete data flow from Velodyne <Term id="lidar" /> to wheel motors
 - Execute the full multi-machine launch sequence from memory
-- Explain exactly what happens when you click a Nav2 goal in RViz2
+- Explain exactly what happens when you click a <Term id="nav2" /> goal in <Term id="rviz2" />
 - Diagnose the five most common integration failures
 - Verify every layer of the stack with a single checklist
 
@@ -74,18 +75,18 @@ Toolbox   costmap    costmap     IMU (LSM6DSOX)
 ```
 
 <Callout type="why">
-There are 14 nodes between the LiDAR firing a laser pulse and a wheel turning. Each one does exactly one job. If any node in the chain stops publishing, everything downstream goes blind. This is why integration testing matters — a single missing TF frame or stale DDS shared-memory file can silently break a node three layers away.
+There are 14 nodes between the LiDAR firing a laser pulse and a wheel turning. Each one does exactly one job. If any node in the chain stops publishing, everything downstream goes blind. This is why integration testing matters — a single missing TF frame or stale <Term id="dds" /> shared-memory file can silently break a node three layers away.
 </Callout>
 
 ### The Three Parallel Streams
 
 The data flow is not a single chain. It splits into three parallel streams that converge at Nav2:
 
-**Stream 1 — Odometry:** The LiDAR point cloud feeds KISS-ICP, which produces an odometry estimate. The IMU provides orientation and angular velocity. The EKF fuses both into `/odometry/local`, the robot's best estimate of where it is relative to where it started. This stream produces the `odom` to `base_footprint` TF transform.
+**Stream 1 — Odometry:** The LiDAR point cloud feeds <Term id="kiss-icp" />, which produces an odometry estimate. The <Term id="imu" /> provides orientation and angular velocity. The <Term id="ekf" /> fuses both into `/odometry/local`, the robot's best estimate of where it is relative to where it started. This stream produces the `odom` to `base_footprint` TF transform.
 
-**Stream 2 — Mapping:** The 2D laser scan feeds SLAM Toolbox, which matches incoming scans against the growing map. This stream produces the `/map` occupancy grid and the `map` to `odom` TF transform. Together with Stream 1, this gives the robot a position in the global map frame.
+**Stream 2 — Mapping:** The 2D laser scan feeds <Term id="slam" /> Toolbox, which matches incoming scans against the growing map. This stream produces the `/map` occupancy grid and the `map` to `odom` TF transform. Together with Stream 1, this gives the robot a position in the global map frame.
 
-**Stream 3 — Obstacle detection:** The same 2D laser scan feeds both the global and local costmaps. The global costmap uses it alongside the SLAM map to plan long-range paths. The local costmap uses it alone to react to obstacles that appeared after the path was planned.
+**Stream 3 — Obstacle detection:** The same 2D laser scan feeds both the global and local <Term id="costmap" />s. The global costmap uses it alongside the SLAM map to plan long-range paths. The local costmap uses it alone to react to obstacles that appeared after the path was planned.
 
 All three streams must be running and healthy for the robot to navigate. If Stream 1 fails, the robot does not know where it is. If Stream 2 fails, it has no map to plan on. If Stream 3 fails, it cannot see obstacles.
 
@@ -93,7 +94,7 @@ All three streams must be running and healthy for the robot to navigate. If Stre
 
 ## The TF Tree in Full
 
-The TF tree is the skeleton that connects every sensor measurement to every other. Here it is, fully expanded:
+The <Term id="tf" /> tree is the skeleton that connects every sensor measurement to every other. Here it is, fully expanded:
 
 ```
 map
@@ -145,7 +146,7 @@ Preflight passed.`}
 
 <CommandBlock command="ssh pi@192.168.0.3 'sudo systemctl start ractor-sensors.service ractor-controls.service'" description="Start LiDAR, IMU, motor control, and MQTT bridge on the Pi" />
 
-Wait 5 seconds for the Velodyne to begin streaming UDP packets. You can verify:
+Wait 5 seconds for the Velodyne to begin streaming <Term id="udp" /> packets. You can verify:
 
 <CommandBlock command="ssh pi@192.168.0.3 'source /opt/ros/jazzy/setup.bash && source ~/sensor_ws/install/setup.bash && ros2 topic hz /velodyne_points --window 5'" description="Verify LiDAR is publishing on the Pi" />
 
@@ -175,7 +176,7 @@ ros2 launch schoolbus_urdf schoolbus.launch.py
 [robot_state_publisher-1] [INFO] [1777544801.203]: got segment front_right_wheel_link`}
 </TerminalOutput>
 
-This publishes the static TF tree (109 links) from the URDF. Leave this terminal running.
+This publishes the static TF tree (109 links) from the <Term id="urdf" />. Leave this terminal running.
 
 ### Step 4: Launch bringup on Laptop
 
@@ -274,7 +275,7 @@ The `control_tower_ros2` node receives `/cmd_vel_nav`. It uses the double-Ackerm
 
 ### 8. MQTT sends to ESCs
 
-The control tower publishes the per-wheel commands over MQTT on localhost. The MQTT bridge forwards them to the four electronic speed controllers (ESCs), which drive the motors. The wheels turn. The robot moves.
+The control tower publishes the per-wheel commands over <Term id="mqtt" /> on localhost. The MQTT bridge forwards them to the four electronic speed controllers (<Term id="esc" />s), which drive the motors. The wheels turn. The robot moves.
 
 ### 9. The loop closes
 
@@ -439,7 +440,7 @@ The robot runs on a dedicated wired network. Every device has a static IP:
 
 All ROS2 nodes use `ROS_DOMAIN_ID=99` to isolate the robot's traffic from any other ROS2 systems on the network. DDS discovery happens over multicast — the Pi and Laptop find each other automatically as long as they are on the same subnet and domain ID.
 
-Time synchronization between the Pi and Laptop is handled by Chrony. The Laptop serves NTP to the Pi. This keeps timestamps aligned to within a few milliseconds, which is critical for TF lookups and sensor fusion.
+Time synchronization between the Pi and Laptop is handled by Chrony. The Laptop serves <Term id="ntp" /> to the Pi. This keeps timestamps aligned to within a few milliseconds, which is critical for TF lookups and sensor fusion.
 
 ---
 

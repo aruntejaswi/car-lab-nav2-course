@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M1: LiDAR
 
@@ -13,8 +14,8 @@ Seeing the world in 3D point clouds.
 By the end of this module you will be able to:
 
 - Explain how a spinning time-of-flight LiDAR measures distances
-- Read and interpret a ROS2 `PointCloud2` message
-- Understand why the 3D point cloud is sliced into a 2D `LaserScan` for SLAM
+- Read and interpret a <Term id="ros2" /> <Term id="pointcloud2" code /> message
+- Understand why the 3D point cloud is sliced into a 2D `LaserScan` for <Term id="slam" />
 
 ---
 
@@ -38,14 +39,14 @@ Each revolution, the sensor fires **1,822 firing sequences**. Each firing sequen
 The result is a 3D point cloud — a set of (x, y, z) coordinates — that refreshes 10 times per second. Every point represents a surface the laser bounced off: a wall, the floor, a chair leg, a person's shin.
 
 <Callout type="why">
-  Time-of-flight LiDAR works in complete darkness, is not confused by textures or colors, and gives millimeter-precision distance measurements. Cameras struggle with blank walls, glass, and lighting changes. This is why the LiDAR is the primary sensor for the robot's odometry, SLAM, costmaps, and collision avoidance.
+  Time-of-flight LiDAR works in complete darkness, is not confused by textures or colors, and gives millimeter-precision distance measurements. Cameras struggle with blank walls, glass, and lighting changes. This is why the LiDAR is the primary sensor for the robot's <Term id="odometry" />, SLAM, <Term id="costmap" />s, and collision avoidance.
 </Callout>
 
 ---
 
 ## Driver Pipeline
 
-The Velodyne LiDAR is a network device. It has its own IP address (192.168.0.201) and streams raw measurement data as UDP packets over Ethernet to the Raspberry Pi.
+The Velodyne LiDAR is a network device. It has its own IP address (192.168.0.201) and streams raw measurement data as <Term id="udp" /> packets over Ethernet to the Raspberry Pi.
 
 Two ROS2 nodes on the Pi turn those UDP packets into usable data:
 
@@ -228,7 +229,7 @@ Breaking this down:
 <Callout type="why">
   The LiDAR is the primary sensor for this robot. Its data feeds four downstream systems, and if the LiDAR stops publishing, all four go blind simultaneously:
 
-  - **KISS-ICP (odometry)** — matches consecutive 3D point clouds to estimate how the robot moved. No clouds, no odometry.
+  - **<Term id="kiss-icp" /> (odometry)** — matches consecutive 3D point clouds to estimate how the robot moved. No clouds, no odometry.
   - **SLAM Toolbox (mapping)** — uses the 2D laser scan to build and update the map. No scan, no map.
   - **Costmaps (obstacle detection)** — marks cells in the navigation grid as occupied based on laser returns. No scan, no obstacle awareness.
   - **Collision monitor (safety)** — uses the scan to emergency-stop if an obstacle appears in the robot's path. No scan, no collision avoidance.
@@ -244,7 +245,7 @@ Breaking this down:
 
 **Possible causes, in order of likelihood:**
 
-1. **ractor-sensors.service not started.** After a power cycle, the systemd services on the Pi don't auto-start. Run `sudo systemctl start ractor-sensors.service` on the Pi.
+1. **ractor-sensors.service not started.** After a power cycle, the <Term id="systemd" /> services on the Pi don't auto-start. Run `sudo systemctl start ractor-sensors.service` on the Pi.
 
 2. **Velodyne not powered.** The LiDAR draws significant power. Check that the relay board on the Pi is energized and the LiDAR's motor is spinning (you can hear it).
 

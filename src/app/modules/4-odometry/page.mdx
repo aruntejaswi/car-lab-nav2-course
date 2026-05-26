@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M4: Odometry — KISS-ICP LiDAR Odometry
 
@@ -15,9 +16,9 @@ By the end of this module you will be able to:
 - Explain what odometry is and why a robot needs it
 - Describe how Iterative Closest Point (ICP) scan matching estimates motion
 - Read and interpret a ROS2 `nav_msgs/Odometry` message
-- Understand odometry drift and why it makes SLAM necessary
+- Understand odometry drift and why it makes <Term id="slam" /> necessary
 
-**Prerequisites:** M1 (LiDAR) and M3 (TF). You should be comfortable with PointCloud2 messages, the Velodyne VLP-16, and the TF coordinate frame tree.
+**Prerequisites:** M1 (<Term id="lidar" />) and M3 (<Term id="tf" />). You should be comfortable with <Term id="pointcloud2" code /> messages, the Velodyne VLP-16, and the TF coordinate frame tree.
 
 ---
 
@@ -29,10 +30,10 @@ Imagine walking across a dark room with your eyes closed. You can feel each step
 
 Most wheeled robots measure odometry with **wheel encoders** — sensors that count how many times each wheel has rotated. Multiply rotations by wheel circumference and you get distance traveled. This school bus robot has no wheel encoders. None. The four motors spin, but nothing counts their rotations.
 
-Instead, this robot uses its LiDAR as its sole odometry source. The algorithm is called **KISS-ICP**, and it works by comparing consecutive 3D point clouds to figure out how the robot moved between them.
+Instead, this robot uses its LiDAR as its sole odometry source. The algorithm is called **<Term id="kiss-icp" />**, and it works by comparing consecutive 3D point clouds to figure out how the robot moved between them.
 
 <Callout type="why">
-  Without odometry, a robot has no sense of its own motion. It cannot follow a planned path, avoid obstacles it has already passed, or maintain a consistent map. Odometry is the foundation that every higher-level navigation system builds on — the EKF (M5), SLAM (M6), and Nav2's path following (M9) all consume odometry as input.
+  Without odometry, a robot has no sense of its own motion. It cannot follow a planned path, avoid obstacles it has already passed, or maintain a consistent map. Odometry is the foundation that every higher-level navigation system builds on — the <Term id="ekf" /> (M5), SLAM (M6), and <Term id="nav2" />'s path following (M9) all consume odometry as input.
 </Callout>
 
 ---
@@ -69,7 +70,7 @@ KISS stands for "Keep It Simple, Stupid." It is a lightweight variant of ICP des
 - **Deskewing** corrects for the fact that the robot is moving during the 100 ms it takes for the LiDAR to complete one revolution. Without deskewing, a fast-moving robot would produce smeared point clouds where the back of the scan and the front of the scan don't agree on where walls are.
 
 <Callout type="see">
-  You can visualize this process in RViz2. Add a PointCloud2 display for <code>/kiss/local_map</code> — this shows the internal map that KISS-ICP builds by accumulating aligned scans. As the robot moves, you will see the map grow outward from the starting position.
+  You can visualize this process in <Term id="rviz2" />. Add a PointCloud2 display for <code>/kiss/local_map</code> — this shows the internal map that KISS-ICP builds by accumulating aligned scans. As the robot moves, you will see the map grow outward from the starting position.
 </Callout>
 
 ---

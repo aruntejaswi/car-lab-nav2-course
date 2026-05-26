@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M10: Motor Control
 
@@ -105,7 +106,7 @@ The robot supports three drive modes, selected by CH7 (Switch C) on the RC trans
 
 ### Ackermann (CH7 = 1000)
 
-Normal forward/reverse driving with coordinated four-wheel steering. This is the mode Nav2 uses. The `cmd_vel` message's `linear.x` sets velocity and `angular.z` sets the steering angle, which gets converted to a turning radius via `R = L / tan(angle)`.
+Normal forward/reverse driving with coordinated four-wheel steering. This is the mode <Term id="nav2" /> uses. The `cmd_vel` message's `linear.x` sets velocity and `angular.z` sets the steering angle, which gets converted to a turning radius via `R = L / tan(angle)`.
 
 ### Fixed Heading (CH7 = 1500)
 
@@ -175,7 +176,7 @@ This message tells the front-left wheel to drive at 0.18 m/s with a steering ang
 
 ### MQTT bridge
 
-The ROS2 `Point` messages don't go directly to the motors. A separate `mqtt_wheel_bridge` node subscribes to the four wheel topics and publishes the values to an MQTT broker running on the Pi. The ESC microcontrollers subscribe to MQTT topics to receive their commands. This two-hop architecture (ROS2 to MQTT to ESC) isolates the motor controllers from the ROS2 network.
+The ROS2 `Point` messages don't go directly to the motors. A separate `mqtt_wheel_bridge` node subscribes to the four wheel topics and publishes the values to an <Term id="mqtt" /> broker running on the Pi. The <Term id="esc" /> microcontrollers subscribe to MQTT topics to receive their commands. This two-hop architecture (ROS2 to MQTT to ESC) isolates the motor controllers from the ROS2 network.
 
 ### cmd_vel timeout
 
@@ -285,7 +286,7 @@ The last message (all zeros) appears when the robot stops — either the joystic
 
 ### Robot doesn't move in auto mode
 
-**Symptom:** Nav2 sends goals, the planner computes a path (visible in RViz2), but the robot sits still. No wheel commands appear on the `/control/frontleft/control` topic.
+**Symptom:** Nav2 sends goals, the planner computes a path (visible in <Term id="rviz2" />), but the robot sits still. No wheel commands appear on the `/control/frontleft/control` topic.
 
 **Diagnosis:**
 

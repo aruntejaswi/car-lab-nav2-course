@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M2: IMU
 
@@ -15,7 +16,7 @@ By the end of this module you will understand:
 - How accelerometers and gyroscopes work at the MEMS level
 - How to read and interpret real IMU data from the robot
 - Why magnetometer-based yaw is disabled indoors
-- How IMU angular velocity feeds into the EKF for smooth odometry
+- How IMU angular velocity feeds into the <Term id="ekf" /> for smooth odometry
 
 ---
 
@@ -41,7 +42,7 @@ When the robot is stationary, the gyro should read zero on all axes. In practice
 
 Some IMUs include a **magnetometer** (Hall effect sensor) that measures the ambient magnetic field direction. In theory, this gives you an absolute heading reference to magnetic north, like a digital compass.
 
-In practice, it is nearly useless indoors. Steel building structures, electric motors, battery cables, and the robot's own electronics create magnetic interference that overwhelms the Earth's field. On this robot, enabling magnetic yaw caused SLAM maps to warp and rotate — a problem we will examine in detail later in this module.
+In practice, it is nearly useless indoors. Steel building structures, electric motors, battery cables, and the robot's own electronics create magnetic interference that overwhelms the Earth's field. On this robot, enabling magnetic yaw caused <Term id="slam" /> maps to warp and rotate — a problem we will examine in detail later in this module.
 
 <Callout type="why">
   The accelerometer and gyroscope measure different physical quantities: linear acceleration (m/s^2) and angular velocity (rad/s). Neither one directly tells you position or orientation — that requires integration over time, which is what the EKF does (Module 5). The IMU provides the fast, noisy "between scans" measurements that fill the gaps between the LiDAR's slower but more accurate updates.
@@ -198,7 +199,7 @@ This is the story of a real debugging session that led to disabling magnetic yaw
 
 The robot originally used a **BNO085** IMU, which has an onboard sensor fusion processor that computes absolute orientation. The BNO085 fuses its accelerometer, gyroscope, and magnetometer to produce a heading referenced to **magnetic north** (an ENU — East-North-Up — reference frame).
 
-Meanwhile, **KISS-ICP** (the LiDAR odometry engine) computes its own heading estimate by matching successive point clouds. KISS-ICP's yaw is **relative** — it starts at zero when the node launches, regardless of which direction the robot is facing.
+Meanwhile, **<Term id="kiss-icp" />** (the LiDAR odometry engine) computes its own heading estimate by matching successive point clouds. KISS-ICP's yaw is **relative** — it starts at zero when the node launches, regardless of which direction the robot is facing.
 
 Both of these yaw estimates were fed into the EKF:
 
@@ -334,5 +335,5 @@ Now find the active `imu0_config` line. Confirm that only angular velocity (posi
 
 ## What's Next
 
-- **[M3: TF (Coordinate Frames)](/modules/3-tf)** — How the `imu_link` frame relates to `base_footprint`, `odom`, and `map`. The TF tree is the glue that makes multi-sensor fusion possible.
+- **[M3: TF (Coordinate Frames)](/modules/3-tf)** — How the `imu_link` frame relates to `base_footprint`, `odom`, and `map`. The <Term id="tf" /> tree is the glue that makes multi-sensor fusion possible.
 - **[M1: LiDAR](/modules/1-lidar)** — If you haven't done it yet, see how the Velodyne produces the point clouds that drive KISS-ICP odometry — the other half of the EKF's input.

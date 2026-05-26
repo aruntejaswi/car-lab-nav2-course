@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M8: Path Planning
 
@@ -10,7 +11,7 @@ Given a map of obstacles, find a path the robot can actually drive.
 
 ## Prerequisites
 
-Complete [M7: Costmaps](/modules/7-costmaps) before starting this module. You need a working costmap to plan paths against.
+Complete [M7: Costmaps](/modules/7-costmaps) before starting this module. You need a working <Term id="costmap" /> to plan paths against.
 
 ---
 
@@ -21,7 +22,7 @@ By the end of this module you will be able to:
 - Explain why standard A* grid search does not work for Ackermann-steered vehicles
 - Describe how Hybrid A* plans in (x, y, theta) state space using motion primitives
 - Identify the six types of Dubins curves and why the school bus uses them
-- Read and interpret a Nav2 path message
+- Read and interpret a <Term id="nav2" /> path message
 - Tune the SmacPlannerHybrid parameters for a real robot
 
 ---
@@ -243,7 +244,7 @@ smoother_server:
       do_refinement: true
 ```
 
-The smoother server is available if the behavior tree requests it, but in normal operation the SmacPlanner's built-in smoother handles path refinement before the path is published.
+The smoother server is available if the <Term id="behavior-tree" /> requests it, but in normal operation the SmacPlanner's built-in smoother handles path refinement before the path is published.
 
 ---
 
@@ -251,7 +252,7 @@ The smoother server is available if the behavior tree requests it, but in normal
 
 ### Reading a planned path
 
-After sending a Nav2 goal in RViz (click "2D Goal Pose"), the planner publishes the result on `/plan`:
+After sending a Nav2 goal in <Term id="rviz2" /> (click "2D Goal Pose"), the planner publishes the result on `/plan`:
 
 <CommandBlock command="ros2 topic echo /plan --once" description="Print one Nav2 path message" />
 

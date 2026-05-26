@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M5: Sensor Fusion
 
@@ -25,9 +26,9 @@ By the end of this module you will understand:
 
 You have two sensors that both tell you something about how the robot is moving:
 
-1. **KISS-ICP** (LiDAR odometry) — matches successive point clouds to estimate position (x, y) and heading (yaw). It runs at about 10 Hz, which means one update every 100 ms. When it does update, it is very accurate because it is based on geometry — matching thousands of laser points against each other.
+1. **<Term id="kiss-icp" />** (<Term id="lidar" /> odometry) — matches successive point clouds to estimate position (x, y) and heading (yaw). It runs at about 10 Hz, which means one update every 100 ms. When it does update, it is very accurate because it is based on geometry — matching thousands of laser points against each other.
 
-2. **BNO085 IMU gyroscope** — measures angular velocity (how fast the robot is rotating) at 100 Hz. It updates ten times between each KISS-ICP scan. It detects rotation instantly. But gyroscope readings drift over time — small biases accumulate, and after a few minutes the heading estimate can be off by several degrees.
+2. **BNO085 <Term id="imu" /> gyroscope** — measures angular velocity (how fast the robot is rotating) at 100 Hz. It updates ten times between each KISS-ICP scan. It detects rotation instantly. But gyroscope readings drift over time — small biases accumulate, and after a few minutes the heading estimate can be off by several degrees.
 
 Here is the problem in concrete terms. Imagine the robot is driving forward and starts a sharp right turn:
 
@@ -84,7 +85,7 @@ A plain Kalman Filter works for linear systems. Robot motion is nonlinear (turni
 
 The EKF runs this predict-update cycle at 15 Hz (`frequency: 15.0` in the config). Each cycle, it ingests whatever sensor data has arrived since the last cycle — possibly multiple IMU gyro readings and zero or one KISS-ICP updates — and produces one fused output: the robot's estimated position, orientation, and velocity.
 
-That output is published to `/odometry/local`. Every downstream Nav2 node (controller, costmaps, collision monitor) reads this single topic instead of dealing with raw sensor data directly.
+That output is published to `/odometry/local`. Every downstream <Term id="nav2" /> node (controller, <Term id="costmap" />s, collision monitor) reads this single topic instead of dealing with raw sensor data directly.
 
 ---
 
@@ -205,7 +206,7 @@ KISS-ICP yaw: "you have turned 12 degrees right since startup"
 
 These are measured in completely different reference frames. Indoors, magnetic interference from steel structures, electrical wiring, and motors distorts the magnetic field by 90 to 180 degrees. The BNO085 might report "facing north" when the robot is actually facing east.
 
-The EKF tried to reconcile these incompatible headings by splitting the difference. The result: a slowly drifting heading error that caused SLAM maps to warp into a **fan shape**, where straight walls appeared to rotate outward.
+The EKF tried to reconcile these incompatible headings by splitting the difference. The result: a slowly drifting heading error that caused <Term id="slam" /> maps to warp into a **fan shape**, where straight walls appeared to rotate outward.
 
 ### The Evidence in the Config
 

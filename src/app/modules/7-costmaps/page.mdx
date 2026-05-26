@@ -1,16 +1,17 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M7: Costmaps
 
-The SLAM map says where walls are. Costmaps say where the robot can actually drive.
+The <Term id="slam" /> map says where walls are. Costmaps say where the robot can actually drive.
 
 ---
 
 ## Prerequisites
 
-- **M1 (LiDAR)** — you need to understand `/velodyne_points` and `/velodyne_scan`
+- **M1 (<Term id="lidar" />)** — you need to understand `/velodyne_points` and `/velodyne_scan`
 - **M6 (SLAM)** — you need a running SLAM session producing the `/map` occupancy grid
 
 ---
@@ -39,7 +40,7 @@ Without costmaps, the planner would treat every non-wall cell equally. It would 
 
 ## Two Costmaps, Two Jobs
 
-Nav2 maintains two separate costmaps, each optimized for a different task.
+<Term id="nav2" /> maintains two separate costmaps, each optimized for a different task.
 
 ### Global costmap
 
@@ -199,7 +200,7 @@ If you increase <code>inflation_radius</code> beyond 0.3 m, the inflated zones f
 
 ### Visualizing inflation in RViz
 
-In RViz2, add a `Map` display subscribed to `/global_costmap/costmap`. The display uses a color gradient:
+In <Term id="rviz2" />, add a `Map` display subscribed to `/global_costmap/costmap`. The display uses a color gradient:
 
 - **Purple/magenta** — lethal cells (the obstacle itself)
 - **Blue** — inscribed zone (guaranteed collision)

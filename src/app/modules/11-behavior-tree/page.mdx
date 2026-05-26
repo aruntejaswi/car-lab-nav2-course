@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M11: Behavior Tree
 
@@ -15,13 +16,13 @@ This module builds on concepts from:
 - **M8: Path Planning** — how the planner computes a global path
 - **M9: Path Following** — how the controller tracks that path
 
-You should have a working SLAM + Nav2 stack that can accept and execute navigation goals before starting this module.
+You should have a working <Term id="slam" /> + <Term id="nav2" /> stack that can accept and execute navigation goals before starting this module.
 
 ---
 
 ## What Is a Behavior Tree?
 
-When you send a navigation goal in RViz, something has to orchestrate the entire process: call the planner, hand the path to the controller, monitor progress, detect failures, trigger recovery behaviors, and decide when to give up. That something is a **behavior tree** (BT).
+When you send a navigation goal in <Term id="rviz2" />, something has to orchestrate the entire process: call the planner, hand the path to the controller, monitor progress, detect failures, trigger recovery behaviors, and decide when to give up. That something is a **behavior tree** (BT).
 
 A behavior tree is a hierarchical decision-making structure. It replaces the traditional state machine approach with something more modular. Instead of drawing arrows between states (planning, executing, recovering, aborting) and trying to account for every possible transition, you build a tree of small, composable nodes.
 
@@ -90,7 +91,7 @@ Decorator nodes wrap a single child and modify its behavior. They act as filters
 
 Condition nodes check something and return SUCCESS or FAILURE immediately, without doing any work. They are the "if" statements of the tree.
 
-- **IsPathValid** — checks whether the current path is still collision-free in the costmap
+- **IsPathValid** — checks whether the current path is still collision-free in the <Term id="costmap" />
 - **GoalUpdated** — checks whether the navigation goal has changed since the last tick
 - **IsBatteryLow** — checks battery level (not used on the school bus, but available)
 
@@ -172,7 +173,7 @@ bt_navigator:
 
 **`robot_base_frame: base_footprint`** — used to look up the robot's current position in the TF tree.
 
-**`odom_topic: /odometry/local`** — the fused odometry from the EKF (M5). The BT navigator uses this for progress checking and goal distance calculations.
+**`odom_topic: /odometry/local`** — the fused <Term id="odometry" /> from the <Term id="ekf" /> (M5). The BT navigator uses this for progress checking and goal distance calculations.
 
 **`bt_loop_duration: 10`** — the target loop duration in milliseconds. The BT is ticked at roughly 100 Hz. If a tick takes longer than 10 ms, the system logs a warning but continues.
 

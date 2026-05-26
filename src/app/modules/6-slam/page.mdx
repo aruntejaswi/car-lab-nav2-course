@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M6: SLAM — Building the Map
 
@@ -14,13 +15,13 @@ Imagine you wake up in a dark building with a flashlight. You want to draw a flo
 
 **SLAM** — Simultaneous Localization And Mapping — solves both at once. The robot drives around, taking laser scans and matching them against what it has seen before. Each new scan both extends the map and refines the robot's estimate of where it is within that map. The two problems are not solved sequentially; they are solved together, each improving the other with every new observation.
 
-On the school bus, SLAM Toolbox is the node that performs SLAM. It takes 2D laser scans from `/velodyne_scan` (produced by the pointcloud-to-laserscan converter you set up in M1) and the EKF odometry from M5, and produces two outputs:
+On the school bus, SLAM Toolbox is the node that performs SLAM. It takes 2D laser scans from `/velodyne_scan` (produced by the pointcloud-to-laserscan converter you set up in M1) and the <Term id="ekf" /> odometry from M5, and produces two outputs:
 
 1. **`/map`** — an occupancy grid showing walls, obstacles, and free space
-2. **`map -> odom` TF** — a correction factor that compensates for odometry drift
+2. **`map -> odom` <Term id="tf" />** — a correction factor that compensates for odometry drift
 
 <Callout type="why">
-  Without SLAM, the robot has no map and no way to correct odometry drift. Nav2 cannot plan a path without a map. The controller cannot avoid walls without knowing where walls are. SLAM is the bridge between raw sensor data and intelligent navigation.
+  Without SLAM, the robot has no map and no way to correct odometry drift. <Term id="nav2" /> cannot plan a path without a map. The controller cannot avoid walls without knowing where walls are. SLAM is the bridge between raw sensor data and intelligent navigation.
 </Callout>
 
 ---
@@ -44,7 +45,7 @@ minimum_travel_heading: 0.05    # radians — must rotate ~3 degrees
 
 ### Step 3: Scan matching
 
-SLAM Toolbox takes the new scan and tries to align it with existing scans in the map. This is conceptually similar to the ICP algorithm used by KISS-ICP in M4, but applied to 2D map building instead of 3D odometry. The algorithm slides and rotates the new scan until it best overlaps with what has already been mapped.
+SLAM Toolbox takes the new scan and tries to align it with existing scans in the map. This is conceptually similar to the ICP algorithm used by <Term id="kiss-icp" /> in M4, but applied to 2D map building instead of 3D odometry. The algorithm slides and rotates the new scan until it best overlaps with what has already been mapped.
 
 The Ceres Solver (a nonlinear optimization library) handles the heavy lifting:
 
@@ -77,7 +78,7 @@ mode: mapping
 ```
 
 <Callout type="see">
-  In RViz2, add a <code>Map</code> display subscribed to <code>/map</code>. As you drive the robot, you will see walls and obstacles appear in real time. Gray cells are unknown, white cells are free space, and black cells are occupied (walls, furniture, legs of tables).
+  In <Term id="rviz2" />, add a <code>Map</code> display subscribed to <code>/map</code>. As you drive the robot, you will see walls and obstacles appear in real time. Gray cells are unknown, white cells are free space, and black cells are occupied (walls, furniture, legs of tables).
 </Callout>
 
 ---
@@ -129,7 +130,7 @@ transform_publish_period: 0.05   # publish map->odom TF at 20 Hz
 map_update_interval: 2.0         # rebuild the occupancy grid every 2 seconds
 ```
 
-The `map -> odom` TF is published at 20 Hz so that Nav2 always has a fresh transform. But regenerating the full occupancy grid image is expensive, so it only happens every 2 seconds. This is fine — the map doesn't change rapidly, and Nav2's costmaps update on their own cycle.
+The `map -> odom` TF is published at 20 Hz so that Nav2 always has a fresh transform. But regenerating the full occupancy grid image is expensive, so it only happens every 2 seconds. This is fine — the map doesn't change rapidly, and Nav2's <Term id="costmap" />s update on their own cycle.
 
 ### Frame configuration
 
@@ -295,7 +296,7 @@ This sounds helpful, but in practice it causes problems. If the robot has been p
 
 ## Pitfall: DDS Shared Memory
 
-ROS2 uses DDS (Data Distribution Service) for communication between nodes. On the school bus, DDS uses shared memory files in `/dev/shm/` for fast data transfer. These files persist after nodes are killed.
+ROS2 uses <Term id="dds" /> (Data Distribution Service) for communication between nodes. On the school bus, DDS uses shared memory files in `/dev/shm/` for fast data transfer. These files persist after nodes are killed.
 
 If you launch SLAM with stale DDS shared memory files from a previous session, you can see bizarre symptoms:
 

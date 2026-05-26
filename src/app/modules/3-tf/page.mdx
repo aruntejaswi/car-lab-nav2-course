@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M3: TF — The Coordinate Frame Tree
 
@@ -10,9 +11,9 @@ Every sensor sees the world from a different position. TF2 connects them all.
 
 ## Why TF Exists
 
-The school bus has a LiDAR mounted 93.8 cm above the ground, an IMU at 69.9 cm, and a camera at 66.1 cm. Each sensor measures the world relative to itself. When the LiDAR reports "there's a wall 2.0 meters away," it means 2.0 meters from the LiDAR — not from the robot's base, not from the map origin.
+The school bus has a <Term id="lidar" /> mounted 93.8 cm above the ground, an IMU at 69.9 cm, and a camera at 66.1 cm. Each sensor measures the world relative to itself. When the LiDAR reports "there's a wall 2.0 meters away," it means 2.0 meters from the LiDAR — not from the robot's base, not from the map origin.
 
-That creates a problem. Nav2 plans paths in the `map` frame. KISS-ICP matches laser scans in the `odom` frame. The LiDAR publishes points in the `3d_lidar_link` frame. The IMU reports acceleration in the `imu_link` frame. For any of these systems to work together, something needs to convert coordinates between frames.
+That creates a problem. <Term id="nav2" /> plans paths in the `map` frame. <Term id="kiss-icp" /> matches laser scans in the `odom` frame. The LiDAR publishes points in the `3d_lidar_link` frame. The <Term id="imu" /> reports acceleration in the `imu_link` frame. For any of these systems to work together, something needs to convert coordinates between frames.
 
 That something is **TF2** (Transform Framework 2). TF2 maintains a tree of coordinate transforms so that any ROS2 node can ask: "Where is this point in frame X expressed in frame Y?" and get an answer, even if the two frames are separated by multiple intermediate transforms.
 
@@ -47,7 +48,7 @@ Reading this tree from the bottom up:
 - **Sensor frames** (`3d_lidar_link`, `imu_link`, etc.) describe where each sensor sits on the physical robot, relative to `base_link`. These never change — the LiDAR is always bolted to the same mount.
 - **`base_link` to `base_footprint`** is an identity transform (zero translation, zero rotation). They represent the same point. `base_footprint` exists because Nav2 expects a ground-plane frame by convention.
 - **`odom` to `base_footprint`** is the robot's estimated position within the odometry frame. This changes at ~10 Hz as the robot moves.
-- **`map` to `odom`** is the drift correction published by SLAM Toolbox. As odometry accumulates error, SLAM adjusts this transform to keep the robot correctly placed on the map.
+- **`map` to `odom`** is the drift correction published by <Term id="slam" /> Toolbox. As <Term id="odometry" /> accumulates error, SLAM adjusts this transform to keep the robot correctly placed on the map.
 
 <Callout type="see">
   In RViz2, set the Fixed Frame to <code>map</code> and enable the TF display. You will see coordinate axes drawn at each frame — red for X (forward), green for Y (left), blue for Z (up). The sensor frames cluster around the robot body, while <code>odom</code> and <code>map</code> sit at the world origin until the robot moves.
@@ -63,7 +64,7 @@ TF2 publishes transforms on two separate topics, and the distinction matters.
 
 Static transforms are published **once** and latched — every new subscriber receives them immediately without waiting for the next publish cycle. These describe fixed physical relationships that never change at runtime.
 
-On the school bus, all sensor mounts are static. The LiDAR is always at (0.178, 0.0, 0.938) meters relative to `base_link`. The IMU is always at (0.0, 0.0, 0.699). These come from the URDF (the robot's 3D model file) and are published by `robot_state_publisher`.
+On the school bus, all sensor mounts are static. The LiDAR is always at (0.178, 0.0, 0.938) meters relative to `base_link`. The IMU is always at (0.0, 0.0, 0.699). These come from the <Term id="urdf" /> (the robot's 3D model file) and are published by `robot_state_publisher`.
 
 Here are the actual static transforms captured from the running robot:
 
@@ -104,7 +105,7 @@ On the school bus, two transforms are dynamic:
 
 | Transform | Publisher | Rate | What it represents |
 |-----------|-----------|------|--------------------|
-| `odom → base_footprint` | EKF (robot_localization) | ~10 Hz | Robot's estimated position and heading within the odometry frame |
+| `odom → base_footprint` | <Term id="ekf" /> (robot_localization) | ~10 Hz | Robot's estimated position and heading within the odometry frame |
 | `map → odom` | SLAM Toolbox | ~1-5 Hz | Drift correction — the offset between the map and odometry origins |
 
 <Callout type="why">

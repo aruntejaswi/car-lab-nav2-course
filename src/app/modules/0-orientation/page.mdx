@@ -1,6 +1,7 @@
 import Callout from "@/components/Callout"
 import CommandBlock from "@/components/CommandBlock"
 import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
 
 # M0: Orientation
 
@@ -10,7 +11,7 @@ The robot, the network, and ROS2 basics.
 
 ## Meet the Robot
 
-This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D LiDAR, IMU, and the full Nav2 stack running on ROS2 Jazzy. Everything in this course comes from real data captured on this hardware.
+This is a 1/5-scale autonomous school bus. It navigates spaces using a 3D <Term id="lidar" />, <Term id="imu" />, and the full <Term id="nav2" /> stack running on <Term id="ros2" /> Jazzy. Everything in this course comes from real data captured on this hardware.
 
 <div className="my-8 grid grid-cols-1 md:grid-cols-2 gap-4">
   <figure className="m-0">
@@ -19,7 +20,7 @@ This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D
   </figure>
   <figure className="m-0">
     <img src="/images/robot-top-down.jpg" alt="School bus robot — top-down view showing all components" className="rounded-lg border border-zinc-200 dark:border-zinc-700" />
-    <figcaption className="text-sm text-zinc-500 mt-2">Top-down view. The Velodyne LiDAR (silver puck on purple mount) sits at the front-left. All four independently-steerable wheels are visible.</figcaption>
+    <figcaption className="text-sm text-zinc-500 mt-2">Top-down view. The Velodyne LiDAR (silver puck on purple mount) sits at the front-left. Two of the four independently-steerable wheels are visible.</figcaption>
   </figure>
 </div>
 
@@ -32,9 +33,9 @@ This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D
   <div>
     <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">Velodyne VLP-16 LiDAR</h4>
     <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
-      The silver spinning puck on the purple 3D-printed mount. Fires 16 laser beams in a vertical fan while rotating 360 degrees, producing ~29,000 distance measurements per revolution at 10 Hz. This is the robot's primary sensor — it drives odometry, SLAM, costmaps, and collision avoidance. Mounted at (0.178, 0.0, 0.938) meters relative to the robot base, pointed forward.
+      The silver spinning puck on the purple 3D-printed mount. Fires 16 laser beams in a vertical fan while rotating 360 degrees, producing ~29,000 distance measurements per revolution at 10 Hz. This is the robot's primary sensor — it drives <Term id="odometry" />, <Term id="slam" />, <Term id="costmap">A 2D grid where each cell has a cost value (0 = free, 254 = lethal obstacle). Nav2 uses costmaps to decide where the robot can safely drive. Covered in M7.</Term>s, and collision avoidance. Mounted at (0.178, 0.0, 0.938) meters relative to the robot base, pointed forward.
     </p>
-    <p className="text-xs text-zinc-500 mt-1 mb-0">Network: 192.168.0.201 · Topic: <code>/velodyne_points</code> · Frame: <code>3d_lidar_link</code></p>
+    <p className="text-xs text-zinc-500 mt-1 mb-0">Network: 192.168.0.201 · Topic: <code>/velodyne_points</code> · Frame: <code>3d_lidar_link</code> · <a href="https://ouster.com/downloads/velodyne-downloads" target="_blank" rel="noopener noreferrer" className="underline hover:text-zinc-700 dark:hover:text-zinc-300">Datasheet</a></p>
   </div>
 </div>
 
@@ -43,9 +44,9 @@ This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D
   <div>
     <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">Raspberry Pi 4 (ARM64)</h4>
     <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
-      The onboard computer. Runs Ubuntu 24.04 with ROS2 Jazzy. Handles sensor drivers (Velodyne, IMU), motor control via MQTT, the RC receiver, and robot state publishing. It does NOT run SLAM or Nav2 — those need more compute and run on the laptop. The green relay board on top controls power to ESCs and motors.
+      The onboard computer. Runs Ubuntu 24.04 with ROS2 Jazzy. Handles sensor drivers (Velodyne, IMU), motor control via <Term id="mqtt" />, the RC receiver, and robot state publishing. It does NOT run SLAM or Nav2 — those need more compute and run on the laptop. The green relay board on top controls power to <Term id="esc" />s and motors.
     </p>
-    <p className="text-xs text-zinc-500 mt-1 mb-0">IP: 192.168.0.3 · Username: pi</p>
+    <p className="text-xs text-zinc-500 mt-1 mb-0">IP: 192.168.0.3 · Username: pi · <a href="https://www.raspberrypi.com/products/raspberry-pi-4-model-b/specifications/" target="_blank" rel="noopener noreferrer" className="underline hover:text-zinc-700 dark:hover:text-zinc-300">Specifications</a></p>
   </div>
 </div>
 
@@ -54,7 +55,7 @@ This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D
   <div>
     <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">Double Ackermann Steering</h4>
     <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
-      All four wheels steer independently — this is "double Ackermann" geometry. Each wheel has its own steering servo and drive motor controlled by an ESC. The rear wheels steer opposite to the fronts, giving a tighter turning radius. Wheelbase: 0.711m, track width: 0.558m, minimum turning radius: 0.75m.
+      All four wheels steer independently — this is "double Ackermann" geometry. Each wheel has its own steering servo and drive motor controlled by an <Term id="esc" />. The rear wheels steer opposite to the fronts, giving a tighter turning radius. Wheelbase: 0.711m, track width: 0.558m, minimum turning radius: 0.75m.
     </p>
     <p className="text-xs text-zinc-500 mt-1 mb-0">Topics: <code>/control/frontleft/control</code>, <code>/control/frontright/control</code>, etc.</p>
   </div>
@@ -65,7 +66,7 @@ This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D
   <div>
     <h4 className="font-semibold text-zinc-900 dark:text-zinc-100 mt-0">RC Receiver (TGY-IA6B)</h4>
     <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 mb-0">
-      A 2.4GHz iBus receiver connected to the Pi via serial (<code>/dev/ttyAMA0</code>). Receives 8 channels from the handheld transmitter at 50 Hz. This is the safety system — the physical joystick can override Nav2 at any time, and the E-stop switch halts all motion instantly.
+      A 2.4GHz <Term id="ibus" /> receiver connected to the Pi via serial (<Term id="ttyama0" />). Receives 8 channels from the handheld transmitter at 50 Hz. This is the safety system — the physical joystick can override Nav2 at any time, and the E-stop switch halts all motion instantly.
     </p>
     <p className="text-xs text-zinc-500 mt-1 mb-0">Topics: <code>/control/ch1</code> through <code>/control/ch8</code></p>
   </div>
@@ -97,7 +98,7 @@ This is a 1/5-scale autonomous school bus. It navigates indoor spaces using a 3D
 
 ## Two-Machine Architecture
 
-The robot uses two computers because SLAM and Nav2 are too computationally expensive for the Raspberry Pi's ARM64 CPU.
+The robot uses two computers because SLAM and Nav2 are too computationally expensive for the Raspberry Pi's <Term id="arm64" /> CPU.
 
 ```
 ┌─────────────────────────────┐     Ethernet      ┌─────────────────────────────┐
@@ -120,15 +121,15 @@ The robot uses two computers because SLAM and Nav2 are too computationally expen
 ```
 
 <Callout type="why">
-  The Pi publishes raw sensor data (LiDAR point clouds at 10 Hz, IMU at 100 Hz). ROS2's DDS middleware automatically discovers and transports these topics across the network. The laptop subscribes to them, runs all the heavy processing, and publishes velocity commands back. The Pi's control_tower node receives those commands and drives the motors. Neither machine knows or cares where the data comes from — that's the power of ROS2's distributed architecture.
+  The Pi publishes raw sensor data (LiDAR point clouds at 10 Hz, IMU at 100 Hz). ROS2's <Term id="dds" /> middleware automatically discovers and transports these topics across the network. The laptop subscribes to them, runs all the heavy processing, and publishes velocity commands back. The Pi's control_tower node receives those commands and drives the motors. Neither machine knows or cares where the data comes from — that's the power of ROS2's distributed architecture.
 </Callout>
 
 ### Network Details
 
 - **All machines** share `ROS_DOMAIN_ID=99` — this isolates the robot's ROS2 traffic from other robots or development machines on the same network
-- **Velodyne LiDAR** has its own IP (192.168.0.201) and streams raw UDP packets to the Pi's driver node
+- **Velodyne LiDAR** has its own IP (192.168.0.201) and streams raw <Term id="udp" /> packets to the Pi's driver node
 - **DDS (Fast-RTPS)** handles topic discovery and transport between Pi and laptop automatically
-- **Chrony NTP** keeps clocks synchronized — the laptop serves time to the Pi
+- **Chrony <Term id="ntp" />** keeps clocks synchronized — the laptop serves time to the Pi
 
 ---
 
@@ -138,7 +139,7 @@ If you're new to ROS2, here's the minimum you need to know to follow this course
 
 ### Nodes
 
-A node is a process that does one thing. The Velodyne driver is a node. KISS-ICP is a node. The motor controller is a node. Each runs independently.
+A node is a process that does one thing. The Velodyne driver is a node. <Term id="kiss-icp" /> is a node. The motor controller is a node. Each runs independently.
 
 <CommandBlock command="ros2 node list" description="List all running nodes" />
 
@@ -156,7 +157,7 @@ A node is a process that does one thing. The Velodyne driver is a node. KISS-ICP
 </TerminalOutput>
 
 <Callout type="see">
-  Node names use slashes for namespacing. Everything under <code>/control/</code> is part of the motor control system. <code>velodyne_driver_node</code> reads raw UDP packets; <code>velodyne_transform_node</code> converts them to PointCloud2 messages.
+  Node names use slashes for namespacing. Everything under <code>/control/</code> is part of the motor control system. <code>velodyne_driver_node</code> reads raw UDP packets; <code>velodyne_transform_node</code> converts them to <Term id="pointcloud2" /> messages.
 </Callout>
 
 ### Topics
@@ -222,7 +223,7 @@ fields:
 </TerminalOutput>
 
 <Callout type="see">
-  Every ROS2 message has a <code>header</code> with a timestamp and a <code>frame_id</code>. The frame_id (<code>3d_lidar_link</code>) tells you which coordinate frame the data is expressed in — this connects to the TF system covered in M3. The <code>fields</code> describe the point cloud format: each point has x, y, z position, intensity (reflectivity), and ring (which of the 16 laser beams generated it).
+  Every ROS2 message has a <code>header</code> with a timestamp and a <code>frame_id</code>. The frame_id (<code>3d_lidar_link</code>) tells you which coordinate frame the data is expressed in — this connects to the <Term id="tf" /> system covered in M3. The <code>fields</code> describe the point cloud format: each point has x, y, z position, intensity (reflectivity), and ring (which of the 16 laser beams generated it).
 </Callout>
 
 ### Checking Data Rates
@@ -288,13 +289,13 @@ The order matters. Each component depends on what comes before it.
 
 ### Step 1: Start Pi Services
 
-The Velodyne driver, IMU driver, and motor control run as systemd services on the Pi. After a power cycle, they need to be started manually:
+The Velodyne driver, IMU driver, and motor control run as <Term id="systemd" /> services on the Pi. After a power cycle, they need to be started manually:
 
 <CommandBlock command="ssh pi@192.168.0.3 'sudo systemctl start ractor-sensors.service ractor-controls.service'" description="Start sensor and motor services on Pi" />
 
 ### Step 2: Launch robot_state_publisher on Pi
 
-This publishes the URDF (robot model) as TF transforms. Without it, no other node can locate the LiDAR or IMU in space.
+This publishes the <Term id="urdf" /> as TF transforms. Without it, no other node can locate the LiDAR or IMU in space.
 
 <CommandBlock command="ros2 launch schoolbus_urdf schoolbus.launch.py" description="Run on Pi — publishes TF tree from URDF" />
 
@@ -309,9 +310,9 @@ This publishes the URDF (robot model) as TF transforms. Without it, no other nod
 This single launch file starts:
 - `pointcloud_to_laserscan` — converts 3D point cloud to 2D laser scan
 - `KISS-ICP` — LiDAR odometry (scan matching)
-- `EKF` — sensor fusion (KISS-ICP + IMU)
+- <Term id="ekf">Extended Kalman Filter — fuses KISS-ICP LiDAR odometry (10 Hz) with IMU angular velocity (100 Hz) into a single smooth pose estimate.</Term> — sensor fusion (KISS-ICP + IMU)
 - `SLAM Toolbox` — map building (activates immediately)
-- `Nav2` — costmaps, planner, controller, behavior tree (activates after 25-second delay)
+- `Nav2` — costmaps, planner, controller, <Term id="behavior-tree" /> (activates after 25-second delay)
 
 ### Step 4: Wait ~35 seconds
 
@@ -335,7 +336,7 @@ SLAM Toolbox needs time to initialize and start publishing the `map` frame. Nav2
 
 ### Step 5: Open RViz2 and Send Goals
 
-Launch RViz2 on the laptop, set the Fixed Frame to `map`, and add displays for the point cloud, map, costmaps, and path. Use the "Nav2 Goal" tool to click a destination on the map.
+Launch <Term id="rviz2" /> on the laptop, set the Fixed Frame to `map`, and add displays for the point cloud, map, costmaps, and path. Use the "Nav2 Goal" tool to click a destination on the map.
 
 Before sending goals, flip Switch B on the RC transmitter to **Auto** (CH8 = 2000).
 
