@@ -14,6 +14,7 @@ const modules = [
   { number: 10, title: "Motor Control", description: "From cmd_vel to wheel motion", prerequisites: ["M9"], href: "/modules/10-motor-control" },
   { number: 11, title: "Behavior Tree", description: "Nav2 decision making", prerequisites: ["M8", "M9"], href: "/modules/11-behavior-tree" },
   { number: 12, title: "Integration", description: "The full stack end-to-end", prerequisites: ["All"], href: "/modules/12-integration" },
+  { number: 13, title: "GPS", description: "RTK position and moving-baseline heading", prerequisites: ["M2", "M5"], href: "/modules/13-gps" },
 ]
 
 export default function Home() {
@@ -39,7 +40,7 @@ export default function Home() {
             Learning Nav2 from Scratch
           </h1>
           <p className="mt-4 text-lg sm:text-xl text-zinc-600 dark:text-zinc-400 max-w-2xl leading-relaxed">
-            A 13-module robotics course built around a real autonomous school bus.
+            A 14-module robotics course built around a real autonomous school bus.
             Every concept taught with data captured from physical hardware — Velodyne LiDAR,
             IMU, GPS, and double-Ackermann steering on ROS2 Jazzy.
           </p>
@@ -81,7 +82,9 @@ export default function Home() {
   │       │
   │       └──── M11 Behavior Tree
   │
-  └──── M12 Integration (all modules)`}</pre>
+  └──── M12 Integration (all modules)
+
+  M13 GPS (optional) ──▶ absolute position + heading into the global EKF (cf. M5)`}</pre>
         </div>
 
         {/* Module grid */}

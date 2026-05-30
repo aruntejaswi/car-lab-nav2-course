@@ -1,0 +1,284 @@
+import Callout from "@/components/Callout"
+import CommandBlock from "@/components/CommandBlock"
+import TerminalOutput from "@/components/TerminalOutput"
+import Term from "@/components/Term"
+
+# M13: GPS
+
+Centimeter-level position and true heading from carrier-phase GNSS
+
+---
+
+## Learning Objectives
+
+By the end of this module you will understand:
+
+- The difference between consumer <Term id="gnss" />, <Term id="rtk" /> (centimeter) positioning, and **moving-baseline heading**
+- Why this robot carries **two** GNSS receivers and two antennas instead of one
+- How to read and validate real position and heading data from the receiver
+- Why a valid heading needs open sky and a rigid antenna mount — and how that differs from a *configuration* fault
+- How the GPS will eventually feed the global <Term id="ekf" /> through <Term id="navsat-transform" />
+- The real debugging story of how the heading was dead on arrival, and exactly how we fixed it
+
+---
+
+## From GPS to RTK to Heading
+
+### Plain GPS: good enough to find a restaurant, useless for a robot
+
+A standard GNSS receiver measures the **travel time** of the coded signal from each satellite and trilaterates a position. The signal's "code" has a wavelength of ~300 m, so even a good receiver lands you within **2–5 meters** of truth. That is fine for a phone map. It is hopeless for a robot that needs to know which lane it is in.
+
+### RTK: measuring the carrier wave instead of the code
+
+<Term id="rtk" /> positioning ignores the coarse code and instead counts the **carrier wave** itself — the underlying ~19 cm radio wavelength (L1). If you can count carrier cycles, you can position to **centimeters**. The catch: counting cycles leaves an unknown whole number of wavelengths (the "integer ambiguity"). Resolving it requires a stream of correction data (<Term id="rtcm" />) from a second receiver whose position relationship is known.
+
+The solution climbs a three-rung ladder, and you will watch it do exactly this outdoors:
+
+| `carrSoln` | Meaning |
+|------------|---------|
+| `none` | No carrier-phase solution. Position is ordinary meter-level GPS. |
+| `float` | Carrier solution exists but the integer ambiguity is unresolved — decimeter-ish, jumpy. |
+| `fixed` | Integers resolved. **Centimeter** accuracy, and the only state where heading is trustworthy. |
+
+### Moving baseline: heading without a compass
+
+Normally RTK needs a stationary **base station** at a surveyed point. This robot does something cleverer: the "base" is a **second antenna bolted to the robot itself**. This is <Term id="moving-baseline" /> mode. Instead of an absolute correction, it computes the precise 3D **vector between the two antennas** — and the direction of that vector *is the robot's heading*, referenced to **true north**, accurate to a fraction of a degree.
+
+<Callout type="why">
+  This is a big deal for navigation. In M2 you saw why the magnetometer-based compass is useless indoors and near the robot's own motors. Moving-baseline GPS heading has no such problem — it is derived from satellite geometry, not the Earth's magnetic field. It needs open sky, but it does not care about steel, motors, or battery cables. It is the cleanest absolute-yaw source the robot has outdoors.
+</Callout>
+
+---
+
+## The Hardware
+
+The robot's GPS is an **ArduSimple simpleRTK2B v1.3** carrying **two <Term id="zed-f9p" /> modules** (firmware **HPG 1.51**, protocol version 27.50). It enumerates over USB as a u-blox GNSS receiver, **VID:PID `1546:01A9`**.
+
+{/* eslint-disable-next-line @next/next/no-img-element */}
+<img src="/images/gps/simplertk2b-board.jpg" alt="ArduSimple simpleRTK2B dual-F9P heading board" className="my-6 rounded-lg border border-zinc-200 dark:border-zinc-800" />
+
+Two receivers means two roles:
+
+| Board | Role | Antenna | Host access |
+|-------|------|---------|-------------|
+| **Budget** (main) | **Rover** — computes the baseline, outputs heading | "rover" antenna | Native USB at the **`POWER + GPS`** port |
+| **Lite** (piggybacked) | **Moving base** — streams corrections to the rover | "base" antenna | **No USB of its own** — reached over the FTDI **`POWER + XBEE`** port |
+
+The two boards talk to each other directly over a private serial link — **Lite `UART1` → Rover `UART2` at 460800 baud** — carrying the <Term id="rtcm" /> correction stream. You never see that link from the host; it is internal to the kit.
+
+<Callout type="warning">
+  Plug the host cable into the Budget board's **`POWER + GPS`** port. That is the rover's native USB and the only port that gives you heading. Do **not** use `POWER + XBEE` (that is the FTDI bridge to the moving base, for configuration only) — plugging into the wrong port is the single most common "where is my data?" mistake with this kit.
+</Callout>
+
+{/* eslint-disable-next-line @next/next/no-img-element */}
+<img src="/images/gps/simplertk2b-ports.jpg" alt="Back of the simpleRTK2B showing the serial number, the four power-source options, and the USB ports" className="my-6 rounded-lg border border-zinc-200 dark:border-zinc-800" />
+
+The board can be powered from four places (`GPS USB`, `XBEE USB`, Pixhawk, or Arduino rails) — but for our purposes the host connects to the **`POWER + GPS`** USB, which is also the rover's data port.
+
+---
+
+## The Data It Produces
+
+On the rover's USB you get a 5 Hz stream of both NMEA (human-readable text) and UBX (u-blox binary). The two messages we care about for the robot:
+
+| Message | Protocol | Carries | Rate |
+|---------|----------|---------|------|
+| `NAV-PVT` | UBX | Position, velocity, time, fix type, sat count | 5 Hz |
+| `NAV-RELPOSNED` | UBX | **Heading**, antenna baseline, accuracy, `carrSoln` | 5 Hz |
+| `NAV-STATUS` | UBX | Fix/diff-solution status | 5 Hz |
+| `GGA`/`RMC`/`GSA`/`VTG` | NMEA | Position, fix quality, HDOP, sats (text) | 5 Hz |
+
+<Callout type="why">
+  Heading is <strong>UBX-only</strong>. It lives in <code>NAV-RELPOSNED</code> and is never emitted as an NMEA sentence on this kit. If you only parse NMEA (the easy, text-based path), you will get position but you will <em>never</em> see heading and may wrongly conclude the heading is broken. To read heading you must decode the binary UBX frame.
+</Callout>
+
+The fields that matter inside `NAV-RELPOSNED`:
+
+- `carrSoln` — the none/float/fixed ladder from above.
+- `relPosHeadingValid` — whether `relPosHeading` is currently trustworthy.
+- `relPosLength` — the baseline length. **It should equal the physical distance between your two antennas.** If it does not, you are not truly fixed.
+- `relPosHeading` — the heading in degrees from true north.
+- `accHeading` — the receiver's own estimate of heading accuracy (degrees). Sub-degree when fixed.
+
+---
+
+## Hands-On: Validate the Sensor
+
+Two small read-only Python scripts (pyserial, no u-center or special drivers) are all you need. Download them: [`gps_check.py`](/gps/gps_check.py) and [`gps_heading_live.py`](/gps/gps_heading_live.py).
+
+### Step 1 — Find the port
+
+<CommandBlock command="ls /dev/cu.usbmodem*   # macOS;  on Linux:  ls /dev/serial/by-id/" description="Locate the rover's USB serial device" />
+
+<Callout type="warning">
+  The device-node name is <strong>not stable</strong>. Across replugs and power cycles we watched it change from <code>usbmodemROVER1</code> to <code>usbmodem11401</code> to <code>usbmodem1101</code>. Never hard-code the node name. On Linux, match by the stable VID:PID with a udev rule (<code>ATTRS&#123;idVendor&#125;=="1546", ATTRS&#123;idProduct&#125;=="01a9"</code>), not by <code>/dev/ttyACM0</code>.
+</Callout>
+
+### Step 2 — Check position, fix, and satellites
+
+<CommandBlock command="python3 gps_check.py /dev/cu.usbmodem1101 20" description="Capture 20s and summarize fix quality, sats, HDOP, and stream health" />
+
+<TerminalOutput title="gps_check.py — rover with antennas on open sky">
+{`Port: /dev/cu.usbmodem1101   capture: 20s
+
+=== RAW ===
+bytes: 74210  (~3711 B/s)
+UBX binary sync frames (0xB5 0x62): 412
+NMEA lines: 503  (bad checksum: 0)
+
+=== NMEA sentence types (count) ===
+  GNGGA: 100  (~5.0 Hz)
+  GNGSA: 100  (~5.0 Hz)
+  GNRMC: 100  (~5.0 Hz)
+  GNVTG: 100  (~5.0 Hz)
+
+=== FIX ===
+  fix: GPS (SPS)
+  sats: 27
+  hdop: 0.57
+  lat: 4228.7xxxx,N
+  lon: 08319.4xxxx,W
+  alt: 251.3,M
+
+=== HEADING (moving baseline) ===
+  heading sentence seen: False
+  heading valid: False  value: None`}
+</TerminalOutput>
+
+Things to read off this: the stream is clean (**0 bad checksums**), all four NMEA types arrive at a steady **5 Hz**, UBX binary is present, and we have a solid 3D fix with **27 satellites** and an excellent **HDOP of 0.57**. Note the last block: heading is **not** visible here — because, as warned, heading is UBX-only and this NMEA-based check cannot see it.
+
+### Step 3 — Watch the heading converge
+
+<CommandBlock command="python3 gps_heading_live.py /dev/cu.usbmodem1101 30" description="Decode NAV-RELPOSNED live: watch carrSoln climb none -> float -> fixed" />
+
+<TerminalOutput title="gps_heading_live.py — antennas mounted rigidly, open sky">
+{`Port: /dev/cu.usbmodem1101  monitor: 30s
+
+t=  0.4s  carrSoln=fixed relPosValid=True  hdgValid=True  baseline=0.940m heading= 173.05deg accHdg=0.66 [rover fix=3D numSV=23 carrSoln=fixed]
+t=  5.4s  carrSoln=fixed relPosValid=True  hdgValid=True  baseline=0.920m heading= 172.37deg accHdg=0.62 [rover fix=3D numSV=22 carrSoln=fixed]
+t= 12.0s  carrSoln=fixed relPosValid=True  hdgValid=True  baseline=0.930m heading= 174.11deg accHdg=0.61 [rover fix=3D numSV=23 carrSoln=fixed]
+t= 20.0s  carrSoln=fixed relPosValid=True  hdgValid=True  baseline=0.920m heading= 175.36deg accHdg=0.62 [rover fix=3D numSV=23 carrSoln=fixed]
+t= 30.0s  carrSoln=fixed relPosValid=True  hdgValid=True  baseline=0.910m heading= 174.93deg accHdg=0.63 [rover fix=3D numSV=26 carrSoln=fixed]`}
+</TerminalOutput>
+
+This is what success looks like: `carrSoln=fixed`, `hdgValid=True`, a **baseline pinned at ~0.92 m** (which is exactly the physical spacing of our two antennas — the proof the fix is real), and `accHdg` holding **~0.62°**. The heading is stable to a fraction of a degree while the robot is completely stationary — moving-baseline geometry needs satellite view, not motion.
+
+<Callout type="see">
+  Your pass criteria for "the GPS is a working sensor": a 3D fix with HDOP &lt; ~1, <code>carrSoln=fixed</code>, <code>hdgValid=True</code>, the reported <code>baseline</code> matching your real antenna spacing, and <code>accHdg</code> under 1°. If position is great but heading sits at <code>carrSoln=none</code> with <code>baseline=0.000m</code>, that is a specific, diagnosable fault — see the next section.
+</Callout>
+
+---
+
+## Configuration: Two Interfaces, One Receiver
+
+You mostly will not touch the configuration — it lives in the receiver's flash. But you must understand its shape, because it is the key to every heading problem.
+
+The ZED-F9P is configured through **two different mechanisms at once**:
+
+1. **The modern config-key space** (`CFG-VALSET`/`CFG-VALGET`) — typed key/value items like `CFG-UART2-BAUDRATE = 460800` or `CFG-HW-ANT_CFG_VOLTCTRL = 1`.
+2. **The legacy `CFG-MSG` interface** — older per-message output-rate commands.
+
+Crucially, the **message outputs that make heading work are driven by the legacy interface**. The single most important correction message — **RTCM type 4072.0**, the moving-base reference message — is enabled *only* via legacy `CFG-MSG` (class `0xF5`, id `0xFE`). It reads `0` on every modern config key, yet it is exactly what lets the rover form a baseline.
+
+The minimal working message set:
+
+- **Lite (moving base), out its UART1 → rover:** RTCM `4072.0` + `1077` (GPS) + `1087` (GLONASS).
+- **Rover, out its USB → host:** `NAV-PVT` + `NAV-RELPOSNED`.
+
+<Callout type="why">
+  Because the working state spans <em>both</em> a key dump <em>and</em> a set of legacy message rates, no single config-key export can fully capture it. The authoritative backup is the on-device <strong>flash save</strong> (<code>CFG-CFG</code>), which persists everything regardless of which interface set it. We saved the working config to flash on <em>both</em> boards; that is what survives a power cycle. A key-only backup would silently miss RTCM 4072.0 and the heading would not come back.
+</Callout>
+
+---
+
+## Troubleshooting: The Day the Heading Died
+
+This is a real debugging session. Reading it will save you hours if heading ever stops working — and it is the same shape of bug as the magnetometer story in M2: the sensor *looked* alive but was quietly missing one input.
+
+### The symptom
+
+The rover had a perfectly good **3D position fix with 30+ satellites** — so the device was clearly alive and seeing the sky. But every `NAV-RELPOSNED` frame showed:
+
+```
+carrSoln=none   relPosValid=False   hdgValid=False   baseline=0.000m
+```
+
+A baseline stuck at exactly **0.000 m** for minutes, with plenty of satellites, is the tell. It is **not** a sky problem (the rover had a fix). It means the rover is receiving **no corrections from the moving base** — it has nothing to compute a baseline *against*.
+
+### The root cause
+
+A teammate had earlier **reflashed the receiver firmware** from the u-blox site. Firmware and configuration are different things: the reflash **wiped the ArduSimple heading-kit configuration**. With the config gone, the **Lite board stopped emitting its RTCM 4072.0 stream** to the rover. The rover was still in moving-baseline *rover* mode (it kept emitting empty `NAV-RELPOSNED`), but the moving base had gone silent. No corrections in → no baseline → no heading.
+
+### The fix
+
+1. **Restore the moving-baseline config.** We replayed ArduSimple's official heading-kit config files onto both boards using a small `CFG-VALSET` replayer on the Mac — no u-center or Windows needed.
+2. **Re-enable antenna power (the gotcha).** ArduSimple's stock config files set `CFG-HW-ANT_CFG_VOLTCTRL = 0`, which **cuts power to the active antennas** on these boards. The instant we applied them, satellites dropped to **zero**. The fix was to set `CFG-HW-ANT_CFG_VOLTCTRL = 1` (key `0x10A3002E`) on **both** boards.
+3. **Place the antennas properly.** With config restored, the solution still only reached `float` and would not lock. That last step was pure RF: open sky, a **rigid** mount, the two antennas **≥ ~1 m apart** with ground planes. Once mounted solidly outdoors, the solution carried `float → fixed` in well under a second and held it.
+
+<Callout type="warning">
+  If you ever re-apply the stock ArduSimple config files, you <strong>must</strong> set <code>CFG-HW-ANT_CFG_VOLTCTRL = 1</code> on both boards afterward, or you will have a perfectly configured receiver that sees zero satellites. This bit us immediately and is not obvious from any error message — the receiver just reports no sats, as if the antenna were unplugged.
+</Callout>
+
+### A separate, physical issue: the 180° offset
+
+Once heading worked, we noticed it read ~180° off from the robot's true facing. This is **not** a configuration value — moving-baseline heading is the direction of the vector **from the base antenna to the rover antenna**. If the antennas are mounted front-to-back relative to "forward," the heading is offset by that mounting angle. Fix it *physically* (swap the antenna positions) or *in software* (a constant yaw offset applied in the ROS layer) — but never go looking for it in the receiver config, because it is not there.
+
+### Quick reference
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| 3D fix but **0 satellites** right after a config change | `ANT_CFG_VOLTCTRL = 0` cut antenna power | Set `0x10A3002E = 1` on both boards |
+| Good fix, but `baseline = 0.000 m`, `carrSoln=none` | Moving base not sending RTCM (config wiped) | Restore heading-kit config; confirm Lite emits RTCM 4072.0 |
+| `carrSoln` stuck at `float`, never `fixed` | Sky/multipath: poor placement, no ground plane, antennas too close | Open sky, rigid mount, ≥ ~1 m apart |
+| Position works, heading "missing" entirely | Only parsing NMEA | Decode UBX `NAV-RELPOSNED` (heading is UBX-only) |
+| Port disappears / node renames between runs | Unstable USB/power connection | Reseat cable; match device by VID:PID, not node name |
+| Heading is constantly ~180° (or fixed angle) off | Physical antenna mounting orientation | Swap antennas, or apply a yaw offset in the ROS layer |
+
+---
+
+## How GPS Fits Into Nav2
+
+Everything above validated the GPS as a **standalone sensor**. Fusing it into the navigation stack is the next step, and it mirrors the EKF story from M5.
+
+- **`navsat_transform_node`** (<Term id="navsat-transform" />) converts the receiver's latitude/longitude into the robot's local `map` frame, anchored to a datum.
+- A **global EKF** then fuses that absolute position with the local odometry from M5, correcting the slow drift that any dead-reckoning odometry accumulates.
+- The moving-baseline **heading** can seed the filter's yaw — and unlike the indoor magnetometer we disabled in M2, this absolute heading is trustworthy outdoors.
+
+<Callout type="see">
+  In the current robot config the <code>navsat_transform</code> stub in <code>ekf.yaml</code> is <strong>commented out</strong> — the GPS is validated but not yet fused. Turning it on (a global EKF instance plus <code>navsat_transform_node</code>, and optionally GPS waypoint following) is the integration task that builds directly on this module and on M5.
+</Callout>
+
+---
+
+## Try It
+
+### Level 1: Confirm position and fix quality
+
+<CommandBlock command="python3 gps_check.py /dev/cu.usbmodem1101 20" description="Capture position, sats, HDOP" />
+
+Questions to answer:
+- What is the fix type, satellite count, and HDOP?
+- Is the NMEA stream clean (zero bad checksums) and steady at 5 Hz?
+- Why does the `HEADING` block say `seen: False` even when heading is working?
+
+### Level 2: Watch the carrSoln ladder
+
+Take the robot outside with a clear view of the sky and run the live monitor for a minute:
+
+<CommandBlock command="python3 gps_heading_live.py /dev/cu.usbmodem1101 60" description="Watch carrSoln climb none -> float -> fixed" />
+
+Watch the `carrSoln` field. Cold, it starts at `none`, climbs to `float`, then snaps to `fixed`. Compare the reported `baseline` once fixed against a tape measure between your two antennas — they should match within a couple of centimeters. If they do not, you are not truly fixed.
+
+### Level 3: Reason about the heading
+
+With a `fixed` solution, note the `heading` value, then physically rotate the robot 90° clockwise and note it again.
+
+**Thought experiment:** the heading should increase by ~90°. If it *decreased*, what does that tell you about the antenna mounting? And if, pointing the robot due north, the heading reads ~180° instead of ~0°, where is that error — in the receiver's configuration, or in the physical world? (Re-read the "180° offset" note above.)
+
+---
+
+## What's Next
+
+- **[M5: Sensor Fusion](/modules/5-sensor-fusion)** — the EKF that the GPS will plug into. GPS gives the absolute position and heading that local odometry alone cannot.
+- **[M12: Integration](/modules/12-integration)** — where every sensor, including this one, comes together into the full autonomous stack.
+- **[M2: IMU](/modules/2-imu)** — revisit the magnetometer problem and compare: GPS moving-baseline heading is the outdoor answer to the indoor yaw problem described there.

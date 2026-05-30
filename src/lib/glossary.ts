@@ -4,6 +4,36 @@ export interface GlossaryEntry {
 }
 
 export const glossary: Record<string, GlossaryEntry> = {
+  gnss: {
+    term: "GNSS",
+    definition:
+      "Global Navigation Satellite System — the umbrella term for satellite-positioning constellations (GPS, GLONASS, Galileo, BeiDou). The robot's ZED-F9P receivers track all of them at once for a faster, more robust fix. Covered in M13.",
+  },
+  rtk: {
+    term: "RTK",
+    definition:
+      "Real-Time Kinematic — a GNSS technique that measures the signal's carrier wave (~19 cm) instead of the coarse code (~300 m), reaching centimeter accuracy given a correction stream. Its solution climbs none → float → fixed; only 'fixed' is centimeter-grade. Covered in M13.",
+  },
+  "moving-baseline": {
+    term: "moving baseline",
+    definition:
+      "An RTK mode where the 'base' is a second antenna on the same moving vehicle. Instead of an absolute position correction it yields the precise vector between the two antennas — giving a true-north heading that, unlike a magnetometer, is immune to indoor magnetic interference. Covered in M13.",
+  },
+  rtcm: {
+    term: "RTCM",
+    definition:
+      "RTCM 3.x — the standard binary format for GNSS correction messages. In this kit the moving-base board streams RTCM (notably type 4072.0 plus MSM7 observations 1077/1087) to the rover so it can resolve a carrier-phase baseline. Covered in M13.",
+  },
+  "zed-f9p": {
+    term: "ZED-F9P",
+    definition:
+      "A u-blox multi-band (L1/L2) RTK GNSS receiver module. The robot's ArduSimple simpleRTK2B board carries two of them: one acts as the moving base, the other as the rover that computes position and heading. Covered in M13.",
+  },
+  "navsat-transform": {
+    term: "navsat_transform_node",
+    definition:
+      "A robot_localization node that converts GPS latitude/longitude (NavSatFix) into the robot's local map frame, anchored to a datum, so a global EKF can fuse absolute GPS position with local odometry. Currently commented out in ekf.yaml — the integration step that follows M13.",
+  },
   slam: {
     term: "SLAM",
     definition:
