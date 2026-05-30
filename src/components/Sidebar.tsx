@@ -18,6 +18,7 @@ const modules = [
   { number: 10, title: "Motor Control", slug: "10-motor-control" },
   { number: 11, title: "Behavior Tree", slug: "11-behavior-tree" },
   { number: 12, title: "Integration", slug: "12-integration" },
+  { number: 13, title: "GPS", slug: "13-gps" },
 ]
 
 const tutorials = [
